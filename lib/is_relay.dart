@@ -4,5 +4,6 @@
 library;
 
 export 'src/checks_deliveries.dart';
-export 'src/relay_server.dart' show RelayServer, WritesEntry, writerAt;
+export 'src/relay_server.dart'
+    show RelayPath, RelayServer, WritesEntry, writerAt;
 export 'src/write_rate_bound.dart';

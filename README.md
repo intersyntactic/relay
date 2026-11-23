@@ -30,7 +30,7 @@ final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 8090);
 await RelayServer(
   check: SlackCheck(...),
   write: writerAt('/run/logbook/write.sock'),
-  path: '/slack/events',
+  path: RelayPath.parse('/slack/events')!,
   budget: const Duration(milliseconds: 2500), // inside Slack's 3 s
   rate: WriteRateBound(perMinute: 600, burst: 60),
 ).serve(server);
@@ -49,6 +49,11 @@ await RelayServer(
   `encodeRelayedEvent`, with the budget that remains as the write's timeout.
 - **Answers 2xx** only on `Written` or `AlreadyRecorded`. Every other answer
   is a refusal, so the source can send the delivery again.
+
+A check turns any input into a `Refuse` or, at worst, an `Exception`
+(answered 500). It never throws an `Error`: an `Error` is a bug, and
+`serve` doesn't catch it, so the process ends and the deployment restarts
+it.
 
 It keeps no record of what it has seen. The docking station decides each
 `EventKey` once, so a duplicate costs only a logbook entry.

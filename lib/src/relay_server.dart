@@ -7,6 +7,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:checked_json/checked_json.dart';
 import 'package:is_docking_station_api/is_docking_station_api.dart'
     show encodeRelayedEvent;
 import 'package:is_logbook_client/is_logbook_client.dart';
@@ -55,7 +56,7 @@ final class RelayServer<V extends Object> {
   final WritesEntry write;
 
   /// The only path taken, such as `/api/messages`.
-  final String path;
+  final RelayPath path;
 
   /// The whole request's time, from arrival to answer.
   final Duration budget;
@@ -75,8 +76,14 @@ final class RelayServer<V extends Object> {
   final DateTime Function() _now;
   int _inFlight = 0;
 
-  /// Serves [server] until it closes.
-  Future<void> serve(HttpServer server) => server.forEach(handle);
+  /// Serves [server] until it closes, each request on its own.
+  ///
+  /// An `Error` from a request is a bug, in the relay or in the source's
+  /// check, and is not caught: it ends the process, and the deployment
+  /// restarts it. So a check must turn any input into a [Refuse] or an
+  /// `Exception` (answered 500), never an `Error`.
+  Future<void> serve(HttpServer server) =>
+      server.forEach((req) => unawaited(handle(req)));
 
   /// Handles one request.
   Future<void> handle(HttpRequest req) async {
@@ -87,7 +94,7 @@ final class RelayServer<V extends Object> {
     try {
       await _handle(req, Stopwatch()..start());
     } on Exception catch (e) {
-      log('${check.source} relay: 500 ${e.runtimeType}');
+      _log(500, '${e.runtimeType}');
       try {
         await _end(req, 500);
       } on Exception {
@@ -103,7 +110,7 @@ final class RelayServer<V extends Object> {
     if (req.method != 'POST') {
       return _refuseUnread(req, RefusalStatus.methodNotAllowed, 'method');
     }
-    if (req.uri.path != path) {
+    if (req.uri.path != path.value) {
       return _refuseUnread(req, RefusalStatus.notFound, 'path');
     }
     if (req.contentLength > maxBodyBytes) {
@@ -145,10 +152,23 @@ final class RelayServer<V extends Object> {
       return _answer(req, RefusalStatus.tooManyRequests.code, 'rate bound');
     }
 
-    final remaining = budget - clock.elapsed;
-    if (remaining <= Duration.zero) {
-      return _answer(req, 503, 'budget spent before write');
+    final (recorded, why) = await _write(bytes, budget - clock.elapsed);
+    if (!recorded) {
+      // Not recorded, so the source will send it again: the room it took is
+      // given back, or an outage would leave the bound spent on retries.
+      rate.giveBack();
+      return _answer(req, 503, why);
     }
+    return _answer(req, 200, why, record.response);
+  }
+
+  /// Writes [bytes] within [remaining]. True when the logbook holds the
+  /// entry, whether written now or already there.
+  Future<(bool recorded, String why)> _write(
+    Uint8List bytes,
+    Duration remaining,
+  ) async {
+    if (remaining <= Duration.zero) return (false, 'budget spent before write');
     final (kind, entry) = encodeRelayedEvent(
       check.source,
       at: _now().toUtc(),
@@ -158,23 +178,17 @@ final class RelayServer<V extends Object> {
     try {
       result = await write(kind, entry, remaining).timeout(remaining);
     } on TimeoutException {
-      return _answer(req, 503, 'unanswered: budget spent');
+      return (false, 'unanswered: budget spent');
     }
-    switch (result) {
-      case Written(:final entry):
-        return _answer(req, 200, 'recorded ${entry.hex}', record.response);
-      case AlreadyRecorded(:final entry):
-        return _answer(req, 200, 'already ${entry.hex}', record.response);
+    return switch (result) {
+      Written(:final entry) => (true, 'recorded ${entry.hex}'),
+      AlreadyRecorded(:final entry) => (true, 'already ${entry.hex}'),
       // A chain start has no tip to be behind: the writer isn't one we know.
-      case NotTip(:final tip):
-        return _answer(req, 503, 'not-tip ${tip.hex}');
-      case WriteRefused(:final why):
-        return _answer(req, 503, 'refused $why');
-      case WriteFailed(:final why):
-        return _answer(req, 503, 'failed $why');
-      case Unanswered(:final why):
-        return _answer(req, 503, 'unanswered $why');
-    }
+      NotTip(:final tip) => (false, 'not-tip ${tip.hex}'),
+      WriteRefused(:final why) => (false, 'refused $why'),
+      WriteFailed(:final why) => (false, 'failed $why'),
+      Unanswered(:final why) => (false, 'unanswered $why'),
+    };
   }
 
   /// The body, read until it ends, passes the cap, or [within] runs out.
@@ -215,9 +229,9 @@ final class RelayServer<V extends Object> {
     HttpRequest req,
     int status,
     String reason, [
-    Object? response,
+    JsonObject? response,
   ]) async {
-    log('${check.source} relay: $status $reason');
+    _log(status, reason);
     req.response.statusCode = status;
     if (response != null) {
       req.response.headers.contentType = ContentType.json;
@@ -240,7 +254,7 @@ final class RelayServer<V extends Object> {
     RefusalStatus status,
     String reason,
   ) async {
-    log('${check.source} relay: ${status.code} $reason');
+    _log(status.code, reason);
     req.response
       ..statusCode = status.code
       ..persistentConnection = false
@@ -250,7 +264,34 @@ final class RelayServer<V extends Object> {
     socket.destroy();
   }
 
+  /// One line per request. A reason can carry what a sender sent (a header
+  /// value in a source's refusal), so control characters are escaped and a
+  /// sender can't start a line of its own.
+  void _log(int status, String reason) => log(
+    '${check.source} relay: $status '
+    '${reason.replaceAllMapped(_control, (m) => '\\x${m[0]!.codeUnitAt(0).toRadixString(16).padLeft(2, '0')}')}',
+  );
+
+  static final _control = RegExp(r'[\x00-\x1f\x7f]');
+
   static void _stderr(String line) => stderr.writeln(line);
+}
+
+/// The one path a relay takes: starts with `/`, no whitespace, no query.
+final class RelayPath {
+  const RelayPath._(this.value);
+
+  /// [s] as a path, or null when it isn't one.
+  static RelayPath? parse(String s) =>
+      _form.hasMatch(s) ? RelayPath._(s) : null;
+
+  static final _form = RegExp(r'^/[^\s?#]*$');
+
+  /// The path, as a request's `uri.path` spells it.
+  final String value;
+
+  @override
+  String toString() => value;
 }
 
 sealed class _Body {

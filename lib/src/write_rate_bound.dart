@@ -45,4 +45,7 @@ final class WriteRateBound {
     _tokens -= 1;
     return true;
   }
+
+  /// Gives back the room a [take] took, for a write that didn't record.
+  void giveBack() => _tokens = (_tokens + 1).clamp(0, burst.toDouble());
 }

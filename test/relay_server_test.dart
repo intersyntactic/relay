@@ -13,6 +13,7 @@ import 'package:test/test.dart';
 /// refuses a body of `refuse`.
 final class _TestCheck implements ChecksDeliveries<String> {
   final seenBodies = <Uint8List>[];
+  String reason = 'bad key';
 
   @override
   RelayedEventSource get source => RelayedEventSource.parse('test')!;
@@ -21,7 +22,7 @@ final class _TestCheck implements ChecksDeliveries<String> {
   HeaderCheck<String> checkHeaders(DeliveryHeaders headers, DateTime now) =>
       headers['X-Test-Key'] == 'good'
       ? const HeadersVouch('good')
-      : const HeadersRefused(RefusalStatus.unauthorized, 'bad key');
+      : HeadersRefused(RefusalStatus.unauthorized, reason);
 
   @override
   BodyVerdict checkBody(String vouched, Uint8List body) {
@@ -37,8 +38,12 @@ final class _Write {
   WriteResult Function() answer = () => Written(ObjectId.of(Uint8List(1)));
   Completer<void>? hold;
 
+  /// Completes when the first write arrives.
+  final called = Completer<void>();
+
   Future<WriteResult> call(Kind kind, List<int> body, Duration timeout) async {
     calls.add((kind, body, timeout));
+    if (!called.isCompleted) called.complete();
     await hold?.future;
     return answer();
   }
@@ -66,7 +71,7 @@ void main() {
       RelayServer(
         check: check,
         write: write.call,
-        path: '/in',
+        path: RelayPath.parse('/in')!,
         budget: budget,
         rate: WriteRateBound(perMinute: 1, burst: burst),
         maxBodyBytes: maxBodyBytes,
@@ -200,6 +205,52 @@ void main() {
       await post('refuse');
       expect((await post('one')).$1, 200);
     });
+
+    test('is given back when the write does not record', () async {
+      await start(burst: 1);
+      write.answer = () => const Unanswered('down');
+      expect((await post('one')).$1, 503);
+      write.answer = () => Written(ObjectId.of(Uint8List(1)));
+      expect((await post('one')).$1, 200);
+    });
+  });
+
+  test('a reason cannot start a log line of its own', () async {
+    await start();
+    await post('x', key: 'bad');
+    final check = _TestCheck();
+    final lines = <String>[];
+    final relay = RelayServer(
+      check: check,
+      write: write.call,
+      path: RelayPath.parse('/in')!,
+      budget: const Duration(seconds: 1),
+      rate: WriteRateBound(perMinute: 1, burst: 1),
+      log: lines.add,
+    );
+    final other = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    unawaited(relay.serve(other));
+    check.reason = 'tenant a\nforged line';
+    final client = HttpClient();
+    try {
+      final req = await client.post('127.0.0.1', other.port, '/in');
+      req.headers.set('x-test-key', 'bad');
+      await (await req.close()).drain<void>();
+    } on HttpException {
+      // Dropped unread; the log line is what's checked.
+    } finally {
+      client.close(force: true);
+      await other.close(force: true);
+    }
+    expect(lines.single, isNot(contains('\n')));
+    expect(lines.single, contains(r'tenant a\x0aforged line'));
+  });
+
+  test('a path is a slash and no whitespace or query', () {
+    expect(RelayPath.parse('/api/messages')?.value, '/api/messages');
+    expect(RelayPath.parse('api'), isNull);
+    expect(RelayPath.parse('/a b'), isNull);
+    expect(RelayPath.parse('/a?b'), isNull);
   });
 
   group('the budget', () {
@@ -234,7 +285,7 @@ void main() {
     await start(maxInFlight: 1);
     write.hold = Completer();
     final first = post('first');
-    await Future<void>.delayed(const Duration(milliseconds: 100));
+    await write.called.future;
     expect((await post('second')).$1, anyOf(503, -1));
     write.hold!.complete();
     expect((await first).$1, 200);
