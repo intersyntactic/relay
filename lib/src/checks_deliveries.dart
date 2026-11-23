@@ -85,19 +85,22 @@ final class Refuse extends BodyVerdict {
 
 /// The statuses a relay refuses with. None is a 2xx: a 2xx means recorded.
 enum RefusalStatus {
-  badRequest(400),
-  unauthorized(401),
-  forbidden(403),
-  notFound(404),
-  methodNotAllowed(405),
-  requestTimeout(408),
-  payloadTooLarge(413),
-  tooManyRequests(429),
-  internalServerError(500),
-  serviceUnavailable(503);
+  badRequest(400, 'Bad Request'),
+  unauthorized(401, 'Unauthorized'),
+  forbidden(403, 'Forbidden'),
+  notFound(404, 'Not Found'),
+  methodNotAllowed(405, 'Method Not Allowed'),
+  requestTimeout(408, 'Request Timeout'),
+  payloadTooLarge(413, 'Payload Too Large'),
+  tooManyRequests(429, 'Too Many Requests'),
+  internalServerError(500, 'Internal Server Error'),
+  serviceUnavailable(503, 'Service Unavailable');
 
-  const RefusalStatus(this.code);
+  const RefusalStatus(this.code, this.phrase);
 
   /// The HTTP status code.
   final int code;
+
+  /// The reason phrase for the status line.
+  final String phrase;
 }

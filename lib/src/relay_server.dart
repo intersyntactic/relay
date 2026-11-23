@@ -98,8 +98,9 @@ final class RelayServer<V extends Object> {
   final DateTime Function() _now;
   int _inFlight = 0;
 
-  /// The least time an answer is given to go out, even when the budget is
-  /// all but spent: a refusal nobody receives makes no one retry sooner.
+  /// The time kept back for an answer to go out. The write's timeout leaves
+  /// it, so an answer after a write fits inside the budget; an answer is
+  /// never given less, so a refusal can still reach the sender.
   static const _leastToAnswer = Duration(milliseconds: 250);
 
   /// Serves [server] until it closes, each request on its own.
@@ -126,8 +127,9 @@ final class RelayServer<V extends Object> {
           ? _refuseUnread(req, RefusalStatus.serviceUnavailable, 'busy', left)
           : _handle(req, clock, left));
     } on Exception catch (e) {
-      // Only answering can throw here, on a connection the sender already
-      // closed or stopped reading: there is no one left to answer.
+      // The checks and the write turn their exceptions into answers, so
+      // only answering throws here, on a connection the sender closed or
+      // stopped reading: there is no one left to answer.
       log('${check.source} relay: answer not sent: ${e.runtimeType}');
     } finally {
       if (!full) _inFlight--;
@@ -221,7 +223,7 @@ final class RelayServer<V extends Object> {
       );
     }
 
-    final (outcome, why) = await _write(bytes, budget - clock.elapsed);
+    final (outcome, why) = await _write(bytes, clock);
     switch (outcome) {
       case _Outcome.recorded:
         return _answer(req, 200, why, left, record.response);
@@ -237,24 +239,33 @@ final class RelayServer<V extends Object> {
     }
   }
 
-  /// Writes [bytes] within [remaining], and says what became of it.
+  /// Writes [bytes] in what remains of the budget by [clock], keeping back
+  /// the time an answer needs, and says what became of it.
   ///
-  /// The relay's own `LogbookWriter` with [remaining] as its timeout: it
-  /// destroys its socket when that runs out, so the write ends with the
+  /// The relay's own `LogbookWriter`, whose timeout is that remainder: it
+  /// destroys its socket when that runs out, so the write ends inside the
   /// budget and nothing waits on it after.
-  Future<(_Outcome, String)> _write(Uint8List bytes, Duration remaining) async {
-    if (remaining <= Duration.zero) {
-      return (_Outcome.absent, 'budget spent before write');
-    }
+  Future<(_Outcome, String)> _write(Uint8List bytes, Stopwatch clock) async {
     final (kind, entry) = encodeRelayedEvent(
       check.source,
       at: _now().toUtc(),
       bytes: bytes,
     );
-    final result = await LogbookWriter(
-      logbook.path,
-      timeout: remaining,
-    ).write(kind, entry);
+    final remaining = budget - clock.elapsed - _leastToAnswer;
+    if (remaining <= Duration.zero) {
+      return (_Outcome.absent, 'budget spent before write');
+    }
+    final WriteResult result;
+    try {
+      result = await LogbookWriter(
+        logbook.path,
+        timeout: remaining,
+      ).write(kind, entry);
+    } on Exception catch (e) {
+      // The client turns its own failures into Unanswered; anything else
+      // it lets through may have reached the logbook all the same.
+      return (_Outcome.unknown, 'writer threw ${e.runtimeType}');
+    }
     return switch (result) {
       Written(:final entry) => (_Outcome.recorded, 'recorded ${entry.hex}'),
       AlreadyRecorded(:final entry) => (
@@ -328,8 +339,12 @@ final class RelayServer<V extends Object> {
   /// Answers [status] and drops the connection, leaving the rest of the
   /// body unread. dart:io's `response.close()` reads the whole request body
   /// before it sends a byte, so a refusal sent with it would still wait on
-  /// whatever the sender chooses to send. The flush gets what remains of
-  /// the budget, and the socket is destroyed whatever it does.
+  /// whatever the sender chooses to send.
+  ///
+  /// The socket is taken before anything is written to it, so no output is
+  /// pending when it is handed over, and the status line is written to it
+  /// directly. The flush gets what remains of the budget, and the socket is
+  /// destroyed whatever it does.
   Future<void> _refuseUnread(
     HttpRequest req,
     RefusalStatus status,
@@ -337,12 +352,12 @@ final class RelayServer<V extends Object> {
     Duration Function() left,
   ) async {
     _log(status.code, reason);
-    req.response
-      ..statusCode = status.code
-      ..persistentConnection = false
-      ..contentLength = 0;
-    final socket = await req.response.detachSocket();
+    final socket = await req.response.detachSocket(writeHeaders: false);
     try {
+      socket.write(
+        'HTTP/1.1 ${status.code} ${status.phrase}\r\n'
+        'content-length: 0\r\nconnection: close\r\n\r\n',
+      );
       await socket.flush().timeout(left());
     } on TimeoutException {
       // The sender isn't reading; it gets no answer, as a dropped one.
