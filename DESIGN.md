@@ -9,8 +9,7 @@ is_relay holds what every relay shares. A relay package (`is_github_relay`,
 `is_slack_relay`, the Teams relay in `teams_module`) keeps only its source's
 check and its source's parse.
 
-Round 3, after two strikes (TEMPER.md; all four families RECAST both
-times).
+After three strikes (TEMPER.md). Round 3's findings are folded in.
 
 ## What the relay owns, and what it doesn't
 
@@ -34,34 +33,60 @@ one logbook entry, or none when its bytes match an earlier entry exactly
 
 ## What a relay does, in order
 
-All of it runs inside **one monotonic budget per source**, shorter than the
-source's resend deadline: Slack's 3 s, Teams' 15 s, GitHub's 10 s. Fetching
-keys (Teams), reading the body, the check and the logbook write all share
-it. The relay doesn't give each step its own timeout.
+Each request runs inside **one monotonic budget per source**, shorter than
+the source's own deadline: Slack's 3 s, Teams' 15 s, GitHub's 10 s. The
+budget bounds the whole request, and nothing a request starts outlives it:
 
-A request holds its in-flight permit until its write **settles**, not until
-it answers: until the writer replies, or is_logbook_client's own timeout
-destroys the socket. When the budget runs out, the source gets a 5xx at
-once, but the permit stays held. So the in-flight cap bounds unfinished
-writes as well as open requests, and a slow logbook turns into refusals at
-the door, not a pile of orphaned writes.
+- **Keys are never fetched on a request.** The Teams key set is refreshed in
+  the background and read from memory. With no key set yet, the answer is
+  503 at the door (as teams_relay does today).
+- **The body read is cancelled** at the budget: the socket is destroyed.
+- **The check is synchronous, CPU-bound work** on a body no larger than the
+  cap: an HMAC, or an RS256 verify and a JSON parse. Its time is bounded by
+  the cap, not by a timer.
+- **The write's timeout is the budget remaining**, passed to
+  is_logbook_client, so the client destroys the socket when the budget
+  ends. A write the logbook commits just before that may still land after
+  the 5xx. A retry, if any, then leaves a second entry with the same
+  `EventKey`, which the docking station decides once.
 
-1. **Refuse at the door.** Wrong path or method, a declared length over the
-   cap, too many requests in flight, or a header check that fails: answer and
-   drop the connection without reading the body (`_refuseUnread` in
+So a request's in-flight permit is released when its budget ends at the
+latest, and the in-flight cap bounds all unfinished work.
+
+1. **Refuse at the door**, with a non-2xx, without reading the body: wrong
+   path or method, a declared length over the cap, the in-flight cap full,
+   the source's write-rate bound exceeded, no key set yet, or a header check
+   that fails. Answer and drop the connection (`_refuseUnread` in
    teams_module's `teams_relay.dart`; dart:io's `response.close()` would wait
    for the whole body).
-2. **Read the body** under the cap and the budget into one immutable
-   snapshot that the relay owns.
-3. **Check** the snapshot with the source's check (below).
-4. **Write** the snapshot through is_logbook_client's `LogbookWriter.write`,
-   as `<source>-event` via `encodeRelayedEvent`.
-5. **Answer.** `Written` or `AlreadyRecorded` → 2xx, plus the source's fixed
-   response body if it has one (a Teams invoke response, Slack's
+2. **Read the body** under the cap and the budget into a buffer the relay
+   owns. The check gets an unmodifiable view of it
+   (`UnmodifiableUint8ListView`), so the bytes written are the bytes checked.
+3. **Check** it with the source's check (below).
+4. **Write** it through is_logbook_client's `LogbookWriter.write`, as
+   `<source>-event` via `encodeRelayedEvent`.
+5. **Answer.** `Written` or `AlreadyRecorded` → 2xx, with the check's
+   response body if it gave one (a Teams invoke response, Slack's
    url_verification challenge). Anything else, or the budget running out →
-   5xx, so the source sends it again. A write that lands after its 5xx
-   leaves a second entry with the same `EventKey` when the retry lands too.
-   The docking station decides it once.
+   5xx. `Refuse` → its status, never 2xx. Those are the only answers: **no
+   2xx without a write.**
+
+### When a failure is retried, by source
+
+A 5xx asks the source to try again, and not every source does:
+
+- **Slack** retries up to three times, with backoff.
+- **Teams** resends after 15 s.
+- **GitHub never redelivers on its own.** A failed delivery stays failed
+  until someone redelivers it. The GitHub relay therefore carries a
+  **redelivery sweep** (owner: the GitHub relay's module). Every few minutes
+  it lists the hook's recent deliveries through GitHub's REST API
+  (`GET /repos/{o}/{r}/hooks/{id}/deliveries`) and redelivers each failed one
+  (`POST …/deliveries/{id}/attempts`). A redelivery is the same signed
+  bytes, so it lands through the same front door and the same check. Its
+  `EventKey`, the sha256 of the bytes, makes a sweep that redelivers twice
+  harmless. The sweep holds a GitHub token, so it runs in its own process
+  and the relay itself never does.
 
 is_relay owns every step and the order. The source supplies only the check.
 
@@ -72,32 +97,33 @@ abstract interface class ChecksDeliveries<V extends Object> {
   /// What the headers alone decide, before the body is read.
   HeaderCheck<V> checkHeaders(Headers headers, DateTime now);
 
-  /// The rest, given what the header check vouched for. Returns a verdict,
-  /// never bytes.
-  BodyVerdict checkBody(V vouched, Uint8List body);
+  /// The rest, given what the header check vouched for. [body] can't be
+  /// written to. Returns a verdict, never bytes.
+  BodyVerdict checkBody(V vouched, UnmodifiableUint8ListView body);
 }
 
 sealed class BodyVerdict {}
 final class Record extends BodyVerdict { final JsonObject? response; }
-final class Handshake extends BodyVerdict { final JsonObject response; }
-final class Refuse extends BodyVerdict { final int status; final String reason; }
+final class Refuse extends BodyVerdict { final int status; final String reason; }  // status is never 2xx
 ```
 
-`Handshake` is for a protocol exchange that carries no event, such as
-Slack's `url_verification`. It is answered and not recorded. It isn't a way
-to skip "quiet" events: an authentic event is always `Record`.
+Every authentic delivery is `Record`, Slack's `url_verification` included:
+it is written, and its translator returns `NothingToAdmit`. A `Record`'s
+response body goes out only with a `Written` or `AlreadyRecorded`.
 
 The check returns a verdict. It doesn't return bytes. On `Record`, the
-relay writes **the snapshot it read and handed to the check**. Nothing else
-can be written, because the relay is the only thing that holds a writer and
-the snapshot. No source package can hand it different bytes. That isn't a
-proof the check did its cryptography right. That's what review and the
+relay writes **the buffer it read**, which the check saw only through a view
+it couldn't write to. The relay is the only thing that holds a writer and
+the buffer. No source package can substitute or alter the bytes. That isn't
+a proof the check did its cryptography right. That's what review and the
 audit are for.
 
-With no wake filter, nothing in the relay reads uncovered data to decide
-anything. That matters for GitHub. `X-GitHub-Event` is a header outside the
-HMAC, and a filter on it would let a replayer relabel a signed body
-(`webhook_gate.dart` says so).
+The relay has no wake filter, so outside the check nothing reads
+uncovered data. For GitHub that matters: `X-GitHub-Event` is a header
+outside the HMAC, and a filter on it would let a replayer relabel a signed
+body (`webhook_gate.dart` says so). A Teams check does read uncovered
+data, the activity's `serviceUrl` and recipient, to match them to the token.
+That read happens inside the check and decides only authenticity.
 
 ## What a check vouches for
 
@@ -146,30 +172,37 @@ rest on it.
 
 ## Named tradeoffs
 
-- **A captured Teams token is a write capability until it expires** (owner:
-  teams_module and the docking station's trust rules). A captured token can
-  carry any body, including one that reuses an honest activity's key ahead
-  of it. The protocol doesn't let a relay close that. Mitigations: TLS to
-  the relay, the token's short life, and the trust rule above. This is the
-  first question for the Fable audit.
+**Where a capture happens.** TLS from Microsoft, Slack and GitHub ends at
+the box's TLS proxy, and the hop from the proxy to the relay on loopback is
+cleartext. So the place a token or a body can be captured is **the box**:
+the proxy, its logs, and the loopback hop. Breaking TLS on the internet is
+not the only way. The deploy therefore requires that the proxy keeps no
+`Authorization` header and no request body in any log. Only root and the
+relay's user can read that hop.
+
 - **Approvals through Teams rest on the token staying private** (accepted by
-  Nick, 2026-11-24; owners: teams_module and agent_loop).
-  `ShownMessageJudged.from` becomes NodeApproval/NodeCorrection in agent_loop,
-  and `MessageChanged.from` drives withdrawal. With a captured token, both
-  can name anyone. Accepted because a capture needs a TLS break between
-  Microsoft and the relay, and the token expires. The alternative, stopping
-  a sender-only source from emitting them, would end approvals from Teams.
-  This is the Fable audit's first target.
+  Nick, 2026-11-24; owners: teams_module and agent_loop). A captured Bot
+  Connector token can carry any body until it expires, including one that
+  reuses an honest activity's key ahead of it. `ShownMessageJudged.from`
+  becomes NodeApproval/NodeCorrection in agent_loop, and `MessageChanged.from`
+  drives withdrawal, so with a captured token both can name anyone. Accepted
+  because a capture needs the box (above) and the token expires. The
+  alternative, stopping a sender-only source from emitting them, would end
+  approvals from Teams. This is the Fable audit's first target.
 - **Replays and floods each write a permanent entry** (owner: is_relay).
   With `at` in every body, each exact replay is a new entry, and a captured
   Teams token can write distinct ones. The logbook only grows. A coarse
-  per-source write-rate bound in `RelayServer` caps both. Bytes-only bodies
-  would make exact replays free, but they stay an optimisation (see
-  "Storage").
-- **GitHub has no signed time** (owner: is_relay). A captured body that was
-  never delivered to us is accepted once. One that was delivered is a no-op,
-  because its `EventKey` is the sha256 of its bytes. Capturing one needs a
-  position inside GitHub's TLS to us.
+  per-source write-rate bound, checked at the door, caps both. Its cost is
+  the cost of any flood bound: while one source is flooded, its honest
+  deliveries are refused too. Slack drops them after three retries, Teams
+  after its resends, and GitHub's go to the redelivery sweep. Don't "fix"
+  that by raising the bound until it means nothing. Bytes-only bodies would
+  make exact replays free, but they stay an optimisation (see "Storage").
+- **GitHub has no signed time** (owner: is_relay). A body captured and never
+  delivered to us is accepted once, whenever it is replayed. A body captured
+  after it was delivered is a no-op, because its `EventKey` is the sha256 of
+  its bytes. Slack's five-minute window makes the same capture harmless; for
+  GitHub, the proxy's no-body logging rule is the whole defence.
 
 ## The HTTP front
 
@@ -177,8 +210,8 @@ rest on it.
 behind the TLS proxy, one path, POST only. It takes a `ChecksDeliveries`, the
 writer (a function, `LogbookWriter(path).write` by default, so tests pass a
 fake), a clock, the budget, the body cap, the cap on requests in flight
-(held until each write settles), the per-source write-rate bound, and a
-log. It logs one line per request: the status and the reason, never the
+(each held until its budget ends), the per-source write-rate bound, the key
+source if there is one, and a log. It logs one line per request: the status and the reason, never the
 content.
 
 No `/ws`, no `onEvent`. Those existed for when Intersyntactic ran on Nick's

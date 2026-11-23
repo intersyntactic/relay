@@ -332,3 +332,152 @@ Tesla: "If you want the secrets of the universe, think in energy, frequency and 
 - GitHub: strike `unverifiedHeaders` from the recorded entry and from the translator contract. The translator classifies from the signed body alone and returns `NothingToAdmit` when the bytes are not the one shape it knows. Write the invariant in that paragraph: a delivery that admitted nothing does not consume the body hash, and no label is stored that could. Storage and the GitHub section then agree there is no format change. The interim sentence ("classify from the body") becomes the design.
 - The single budget owns key fetch, the body read, the check, and the write. A write the budget stops waiting for must be incapable of landing. For as long as it can still land, it holds one of the in-flight permits. Delete the sentence that says a late landing is safe.
 - In "What a check vouches for", add two structural lines to the translator contract. A sender-only source cannot emit `ShownMessageJudged`, and cannot emit a `MessageChanged` whose `from` an approval or a withdrawal will believe; the bytes stay in the logbook as testimony those types cannot accept. The Teams `EventKey` is the measured quadruple — conversation, activity type, activity id, timestamp — and the "act on one per conversation and id" sentence in `teamsRecordedEvent` is pointed at that quadruple so the comment stops producing the collapse it was written to cure.
+
+
+---
+
+# Round 3 (final of ≤3)
+
+**Overall verdict:** RECAST, folded; **UN-TEMPERED on the round-3 folds** (provisional). Maxwell SOUND; Carnot, Noether, Tesla RECAST; no DISSOLVE. Every round-2 fold was confirmed closed by at least two adversaries. Round 3 found precision flaws, not shape flaws, and all are folded into DESIGN.md. The skill's three-round budget is spent, so the folds below were never struck themselves. Strike them at the first `/cage-match` on the implementation PR.
+**Struck:** dt-1795443196, families seated: Maxwell + Noether, Carnot, Tesla (Wu disabled)
+
+## Per-family verdicts
+| Family | Verdict | One-line |
+|--------|---------|----------|
+| Maxwell (Claude) | SOUND | Converged. Say what the rate bound answers and what that costs |
+| Carnot (GPT) | RECAST | GitHub never redelivers a failed webhook; pre-write work (key fetch, read, check) has no stated lifetime |
+| Noether (DeepSeek) | RECAST | `Handshake` contradicts step 5; the budget names one bound and means three; a false "no uncovered reads" claim |
+| Tesla (Grok) | RECAST | `Handshake` is a 2xx without a write; `Uint8List` is a writable alias; the rate bound sits outside the order; capture happens at the proxy, not on the wire |
+
+## Fatal flaws (deduped) and dispositions, all folded
+1. **GitHub never redelivers a failed delivery** (Carnot; confirmed against GitHub's docs). Every 5xx from the GitHub relay was a silent loss. FOLDED: "When a failure is retried, by source". The GitHub relay's module runs a redelivery sweep through GitHub's REST API, in its own process, and the bytes `EventKey` makes double redelivery harmless.
+2. **`Handshake` is a 2xx without a write** (Noether, Tesla). FOLDED: deleted. `url_verification` is recorded and its translator returns `NothingToAdmit`. The rule is now "no 2xx without a write", and `Refuse` is never 2xx.
+3. **`Uint8List` is a writable alias, so a check could change the bytes after the HMAC** (Tesla). FOLDED: the check receives an `UnmodifiableUint8ListView`, and the relay writes its own buffer.
+4. **The budget bounded the wait, not the work** (Carnot, Noether). FOLDED: keys are refreshed in the background and never fetched on a request, the body read is cancelled at the budget, the check is CPU-bound under the cap, and the write's timeout is the budget remaining. A permit is released when its budget ends.
+5. **The rate bound sat outside the order and had no stated answer** (Tesla, Maxwell). FOLDED: a door refusal with a non-2xx, and its cost stated (a flooded source's honest deliveries are refused too).
+6. **Capture happens at the proxy, not on the internet** (Tesla). TLS ends at the box's proxy, and the hop to the relay is cleartext. FOLDED: "Where a capture happens" requires the proxy to keep no `Authorization` header and no bodies in logs. Nick's acceptance of the Teams tradeoff stands, with its reasoning corrected to "needs the box". "The trust rule above", which pointed at nothing, is deleted.
+7. **"Nothing in the relay reads uncovered data" was false for Teams** (Noether). FOLDED: the check reads `serviceUrl` and the recipient to decide authenticity, and nothing else does.
+
+## Disposition
+The design is ready for an implementation PR, labelled UN-TEMPERED on the round-3 folds. The first `/cage-match` must strike #1–#7 explicitly. The scheduled Fable audit's first target is the Teams approval path (#6), aimed at agent_loop.
+
+---
+
+**Round 3 strikes, in arrival order:** Maxwell, then Carnot, Noether, Tesla.
+
+## MaxwellMergeSlam's Design Strike (round 3)
+
+**Verdict:** SOUND
+
+**Summary:** After two recasts the relay does one thing per step, and each step reads only what its check covers. What remains is a detail (what the rate bound answers) and the residuals that are named and owned.
+
+**Producer first:** The only check added in round 2 that is still there is the per-source write-rate bound. The bad outcome it catches is the add-only logbook growing without limit from one sender. There are two producers. The first is `at`, which makes each exact replay a new entry. Removing it is possible, and the design says so, but keeps it as an optimisation, because removing it needs a docking station format change that buys storage, not correctness. The second is a sender-only source's token holder writing distinct bodies. That one can't be removed: untrusted bytes cross the boundary whatever the design does. So the bound is the honest check for the second producer, and a stopgap for the first until bytes-only bodies arrive.
+
+**Fatal flaws:**
+- None fatal. One fold: say what the rate bound answers. A 429 or 503 makes the source retry, and Slack gives up after three. So under a flood, honest Slack events are delayed and can then be dropped by Slack itself. That is the unavoidable cost of any bound on a flood. Name it next to the bound, so nobody later "fixes" it by raising the bound until it means nothing.
+
+**What holds:**
+- Authenticity is the relay's job and idempotence is `EventKey`'s. There is no seen set, so nothing answers 200 without its own write.
+- Checks return verdicts, and the relay writes its own snapshot. `Handshake` is limited to exchanges that carry no event.
+- There is no wake filter, and GitHub records no unsigned label, so nothing reads uncovered data to decide meaning.
+- A permit is held until its write settles, inside one budget that includes the key fetch.
+- The Teams token residual is accepted by Nick, has owners, and is the audit's first target. The downstream recovery answers are recorded in TEMPER.md with their open items owned elsewhere.
+
+**If RECAST, what to fold back:**
+- (Not RECAST.) One sentence under the rate bound on its cost: honest events delayed or dropped by the source under a flood.
+
+
+---
+
+## CarnotCodeCarver's Design Strike (round 3)
+
+**Verdict:** RECAST
+
+**Summary:** The round-2 folds remove substantial wasted machinery. Two gaps remain: GitHub does not supply the assumed retry loop, and the resource-lifetime fold covers writes more precisely than key fetching and checking. No real engine matches the Carnot cycle; a reviewer's job is to say how far short we are. The remaining entropy is in recovery assumptions. Dijkstra: "Simplicity is prerequisite for reliability."
+
+**Producer first:** The harms are missed source events and exhausted relay capacity. Outages, overload and stalled key retrieval are triggers. Our producers are discarding an unrecorded GitHub delivery while assuming a 5xx schedules another attempt, and permitting pre-write operations to survive their budget without a defined cancellation or capacity owner. GitHub state reconciliation can structurally remove dependence on individual webhook delivery where events only request a refresh; event-bearing commands instead need explicit durable recovery. Authentication cannot be deleted: untrusted requests must cross this boundary. The accepted Teams authority and permanent-storage costs have named owners and are not reopened here.
+
+**Fatal flaws:**
+- Make missed GitHub state changes impossible: reconcile authoritative GitHub state independently of individual webhook arrivals; then webhook retry checks become unnecessary for projection correctness. The current design instead says every failure produces a 5xx 'so the source sends it again' and calls GitHub's 10 seconds a resend deadline. GitHub explicitly does not automatically redeliver failed deliveries. A full in-flight cap or unavailable logbook can therefore discard the only attempt. If GitHub deliveries carry indispensable occurrences rather than refresh hints, reconciliation cannot replace them: name and provision a durable failed-delivery recovery mechanism instead. This is an unowned reliability gap, distinct from the accepted captured-body tradeoff. [GitHub redelivery documentation](https://docs.github.com/en/webhooks/testing-and-troubleshooting-webhooks/redelivering-webhooks).
+- The unfinished-work fold closes writes but leaves pre-write work underspecified. A stalled Teams key fetch is now inside the waiting budget, but no bounded lifetime, cancellation or shared-fetch ownership is stated. Releasing its permit at expiry can accumulate abandoned fetches; retaining it until an unbounded fetch settles can exhaust every permit. Moreover, checkHeaders and checkBody are synchronous, so a timer cannot enforce the promise to answer 'at once' while either blocks execution. Define a bounded key-provider operation and cancellation of body reads, retain capacity until their actual cleanup, and give synchronous checking an explicit bounded execution contract. The write socket timeout alone does not discharge these earlier stages.
+
+**What holds:**
+- Round-2 #1 closes: GitHub interpretation no longer depends on an unsigned label; ambiguous bodies admit nothing and consume no EventKey.
+- Round-2 #2 closes the pending-write accumulation path: permits survive the HTTP timeout until the writer settles or its socket is destroyed. Late commits need not be prohibited to bound local work.
+- Round-2 #3 closes: Handshake is explicitly restricted to exchanges carrying no event. Authentic quiet events are recorded.
+- Round-2 #4 is explicitly accepted by Nick. Teams approvals and withdrawals retain the stated bearer-token trust model.
+- Round-2 #5 and #6 have downstream owners and concrete dispositions; this review does not move them back into is_relay.
+- Round-2 #7 closes as the accepted storage tradeoff plus a per-source write-rate bound.
+- The seen set stays deleted, the relay owns the immutable checked snapshot, and successful event acknowledgements follow durable recording.
+
+**If RECAST, what to fold back:**
+- Replace the universal resend claim with source-specific recovery contracts. For GitHub, choose authoritative-state reconciliation where sufficient, or assign and provision failed-delivery redelivery before relying on this ingress.
+- Complete the lifecycle contract for key fetching, body reading and synchronous checking. State cancellation, maximum lifetime, permit ownership and cleanup for each stage; reconcile asynchronous key retrieval with the synchronous check interface.
+- Validate two failure traces: GitHub's sole attempt refused during logbook failure, and repeated budget expiries while Teams key retrieval remains stalled.
+
+
+---
+
+## NoetherNullPointer's Design Strike
+
+**Verdict:** RECAST
+
+**Summary:** The recast conserves "record before answer" for events and correctly deletes the seen-set producer, but it stops conserving "the logbook is the only way out" at the `Handshake` verdict, "nothing in the relay reads uncovered data to decide anything" at the Teams check, and "one budget shares the write" at the write that outlives it.
+
+**Producer first:**
+- **A slow logbook or sender piles up unfinished work past the source's resend deadline.** Trigger: a slow logbook, a trickling sender, a stalled key fetch. Producer: an unbounded step — the body read, the Teams key fetch, the write — plus (before round 2) a permit released at answer-time. Removable, and the fold does it: one budget covers the steps and the permit is held until the write settles, so the producer is bounded by the cap and is_logbook_client's timeout. Residual named in flaw 3.
+- **A replay or a flood grows the add-only logbook without bound.** Trigger: a resend, GitHub's Redeliver, a captured Teams token. Producer: `encodeRelayedEvent` mints a fresh `at`, so every write is a new entry id and `AlreadyRecorded` never fires. Removable for exact replays (a bytes-only body); irreducible for distinct bodies, where untrusted bytes cross the trust boundary whatever the design does. The per-source write-rate bound is the check on the irreducible half — review it normally.
+- **A forged Teams activity becomes an approval or a withdrawal.** Trigger: token capture. Producer: the protocol itself — the Bot Framework JWT does not bind the body, so `from` is the token holder's testimony. Irreducible at the relay; owned by teams_module and agent_loop, accepted by Nick. Not re-raised.
+- **The deleted check.** The relay's in-memory seen set guarded "acted on twice." Its producer — a volatile map deciding "seen" before the durable write — is ours, and it is now deleted rather than guarded. That is the right shape.
+
+**Fatal flaws:**
+- **The `Handshake` verdict breaks the invariant step 5 states** ("The delivery check" and "What a relay does, in order", step 5). Step 5 grants 2xx only to `Written` or `AlreadyRecorded`, and its own sentence lists "Slack's `url_verification` challenge" as a 2xx body — but `url_verification` is a `Handshake`, which is "answered and not recorded." So the design's central rule has an unnamed non-recording 2xx path, which is exactly round 2's `Answer` flaw renamed and left half-closed: a reader implementing step 5 sends the handshake to 5xx; a reader implementing the verdict type acks without a logbook line. Class: internal contradiction / the false-acknowledgement shape.
+- **"With no wake filter, nothing in the relay reads uncovered data to decide anything" is false for a sender-only source** ("The delivery check"). The Teams check matches the `serviceurl` claim and the recipient to the activity, and the activity is the uncovered body. The relay's *decision* (record every token-valid activity, filter in the translator) is sound; the *claim* is not, and it would lead a reader to believe the Teams body never reaches a decision when it is the check's input. Class: wrong invariant / misleading coverage.
+- **The budget does not bound the write it claims to share** ("What a relay does, in order"). The doc says "reading the body, the check and the logbook write all share it," then says the write outlives the budget and the permit stays held until it settles. So the budget bounds the *wait*, the cap bounds the *count*, and is_logbook_client's timeout — not the budget — bounds the *duration*. Under a slow logbook a permit can be held past Slack's 3 s resend deadline, which is the deadline the budget exists to stay inside. Class: resource model / wrong invariant.
+
+**What holds:**
+- The seen set and `ReplayKey` are actually gone; nothing answers 2xx from volatile state, and Carnot's race is dead.
+- Idempotence is delegated to the docking station's `EventKey`, and the design correctly refuses to let correctness rest on `at`-free bytes or on every writer sending `previous` as `-`.
+- The construction fix: `checkBody` returns a bytes-free verdict; the relay owns the immutable snapshot and writes exactly what it checked.
+- GitHub's kind is not recorded, no label reaches the translator, ambiguous bodies are `NothingToAdmit`, and `NothingToAdmit` consumes no key. Round 2's `unverifiedHeaders` flaw is closed.
+- `_refuseUnread`, header-first refusal, one whole-body deadline, fail-closed config, Slack's timestamp inside its HMAC, Teams' sender-only coverage named honestly.
+
+**If RECAST, what to fold back:**
+- Step 5: name `Handshake` as a non-recording 2xx in the rule, or record it like every other authentic delivery so the rule is uniform. Step 5 and the verdict type must say the same thing.
+- "The delivery check": correct the claim. For a sender-only source the check reads the uncovered body (the recipient, the activity type); the no-wake-filter rule confines that read to the check, not to a wake decision. Say that, and drop "nothing in the relay reads uncovered data to decide anything."
+- "What a relay does, in order": state that the write's duration is bounded by is_logbook_client's timeout, the in-flight cap bounds the count of unfinished writes, and the budget bounds only the wait. The three bounds are three different things; the doc currently names one and means three.
+
+---
+
+Tesla: "If you want the secrets of the universe, think in energy, frequency and vibration."
+
+## Tesla, the Arc-Prophet's Design Strike
+
+**Verdict:** RECAST
+
+**Summary:** The seen-set and the unsigned label are silent, and underneath them a second acknowledgement doorway is still humming: `Handshake` and step 5 name two different futures for the same 2xx, while the TLS proxy the deploy section seats in front of the relay is exactly the capture position the tradeoffs say an attacker still has to break in from outside.
+
+**Producer first:** Two checks in this recast still guard an outcome our own shape produces. One older producer was deleted on the page and left alive in the type.
+
+- A command is answered, so the source never sends it again, and the logbook never holds it. The trigger is a Teams invoke that must answer with a body, a Slack URL check, or a check author in a hurry. The producer is `Handshake`: authentic, answered, not recorded, while step 5 hangs the Slack challenge and the Teams invoke body on the recorded 2xx. Delete `Handshake`. One authentic terminal, `Record`. The relay writes the snapshot, and only a `Written` or `AlreadyRecorded` may carry the response body out as 2xx. A URL check becomes a logbook line the translator turns into `NothingToAdmit`. `Refuse` is then the only no-write answer, and its status is incapable of 2xx. No second verdict has to remember what was "only a handshake."
+- The bytes that land in the logbook are not the bytes the HMAC saw. The trigger is a check that normalizes, sniffs, or writes through the buffer it was handed. The producer is `checkBody`'s `Uint8List`, a live alias the design calls an immutable snapshot. Delete it: the writer receives a copy taken before the check, and the check receives a view it cannot write. Review of the cryptography stays; it is no longer also the only thing standing between a signed body and a mutated one.
+- The logbook grows without bound until the disk is the outage. The trigger is Redeliver, a retry storm, or a captured Teams token minting distinct bodies. For distinct Teams bodies the producer is the protocol: a bearer that does not bind the body can submit new activities until `exp`, and no relay can make those bytes unwritable. The rate bound is the honest check there, and it stays. For exact replays the producer is ours: `encodeRelayedEvent` still mints `at`, so the same bytes never hash the same. That producer can be removed, and TEMPER already recorded the choice not to remove it. I do not reopen it. The bound that was supposed to make the residue finite is not in the order the relay claims to own, so as written it caps nothing.
+- A captured Teams token approves as anyone, and a captured GitHub body acts once years later. The trigger is observation of the decrypted hop. The producer of *treating that capture as a broken Microsoft TLS session* is the tradeoff text. The deploy section already ends TLS at the proxy and speaks cleartext to loopback. Nick's decision to keep Teams approvals stands. The sentence that locates the attacker outside the proxy is the part that is wrong.
+
+**Fatal flaws:**
+- DESIGN.md "The delivery check" (`Handshake`) against step 5 ("Answer"). Round 2's fold dissolved the wake filter and kept one named no-record answer for a handshake that carries no event. The type does that, and then step 5 does not. `Written` or `AlreadyRecorded` is the only 2xx, "anything else" is 5xx so the source will send it again, and the same sentence attaches both a Teams invoke body and Slack's `url_verification` challenge to that recorded 2xx. `Handshake` says the challenge is answered and not recorded. Read as step 5, Slack's URL check returns 5xx forever and the app never verifies. Read as `Handshake`, any check that owes the source a body — a Teams invoke is the one the parenthetical names in the same breath — has a legal 2xx with no write. That is the false acknowledgement from TEMPER flaw 2, standing in a doorway that was renamed rather than bricked up. The comment that says a handshake is not a way to skip quiet events is a wish. The type cannot tell a challenge echo from a Close.
+- DESIGN.md "one immutable snapshot" and `checkBody(V vouched, Uint8List body)`, in "What a relay does, in order" and "The delivery check." The round-2 fold stopped a source package from *returning* different bytes. It did not stop the package from writing into the buffer it was shown. `Uint8List` is a mutable view. The relay's sentence "no source package can hand it different bytes" is false for an in-place write after the HMAC compares. The logbook then records a body the signature never covered, and every downstream `EventKey` is computed over the mutated bytes. At 3am this will not look like an attack. It will look like a parser that stripped a BOM or rewrote a field on the buffer it already held.
+- DESIGN.md "Named tradeoffs" (replays and floods) against "What a relay does, in order" and "The HTTP front." The per-source write-rate bound is the entire finiteness argument once `at` stays. Step 1's door list is path, method, declared length, in-flight cap, header check. The bound is a constructor argument sitting outside the only order `is_relay` says it owns. An unbounded exact replay of one GitHub body is still one action if the translator's key is the hash, and it is still one permanent entry per replay. A bound that is not in that order, with no status, gets implemented as a polite 2xx the first time someone needs to shed load. A 2xx there is the seen-set's answer again: the source stops, the write never starts.
+- DESIGN.md "The HTTP front" / "Deploy" against both capture tradeoffs. The relay listens on `127.0.0.1` behind the TLS proxy. Microsoft's TLS, and GitHub's, end at that proxy. The hop the relay actually reads is cleartext, and so is any proxy log that keeps an `Authorization` header or a raw body. The Teams tradeoff says a capture needs a TLS break between Microsoft and the relay, then cites "the trust rule above," and no such rule is stated above — the paragraph above says the protocol cannot close it. The GitHub tradeoff says a never-delivered capture needs a position inside GitHub's TLS to us. The deploy section *is* that position, and `webhook_gate.dart`'s flip condition is already met: the body is no longer a trigger for an idempotent refresh, it is bytes a translator admits. Slack's five minutes dies inside the HMAC. A GitHub body has no signed time, so a body the proxy retained last March is a live command on the night the log is copied. Teams tokens expire; the reasoning that puts them only on the far side of TLS does not. Nick's acceptance that Teams approvals rest on the token staying private still holds. The privacy boundary is the proxy and the loopback hop, and the design never makes that hop unable to keep the secret.
+
+**What holds:**
+- Round-2 flaw 1 is closed. No `unverifiedHeaders`. GitHub's kind is not recorded. The translator classifies from the signed body, an ambiguous body (`issues` and `issue_comment` both carry `issue`) is `NothingToAdmit`, and a delivery that admits nothing consumes no `EventKey`. A first label of `ping` has nothing to spend.
+- Round-2 flaw 2 is closed on the write path. One budget covers key fetch, read, check, and write. The permit stays held until the writer replies or `is_logbook_client`'s timeout destroys the socket. A slow logbook becomes refusal at the door. A late landing is a second entry the docking station decides once, which is the disposition, not the old "that's safe" shrug.
+- The wake filter is gone for events. An authentic event is `Record`. Idempotence stays the translator's `EventKey`. The seen set and `ReplayKey` stay gone, and with them the race in `teams_relay.dart`: a duplicate answered 200 from "seen" while the original write was still pending.
+- The logbook is the only way out. `/ws` and `onEvent` stay dead. Door refusal without reading the body, fail-closed on a missing secret, Slack's timestamp inside the HMAC, Teams pinned to sender-only coverage and named as such. `{"at","bytes"}` is storage, and correctness is forbidden from resting on byte-identical resends or on `previous` staying `-`. Parsing stays in the source package. Teams occurrence identity and admission-to-effect recovery stay owned where TEMPER put them.
+
+**If RECAST, what to fold back:**
+- Delete `Handshake`. `Record`'s optional response is the Teams invoke body and the Slack challenge, and step 5 sends it only after `Written` or `AlreadyRecorded`. `Refuse.status` cannot be a 2xx. The answer table is those three rows and nothing else. A URL verification is a logbook line; the translator returns `NothingToAdmit`.
+- In "The delivery check," the snapshot the writer sees is the copy taken before `checkBody`. The check is given a view it cannot mutate. The guarantee "the bytes recorded are the bytes checked" then has a mechanism.
+- Put the write-rate bound in step 1. Over the bound, the relay refuses without reading, with a non-2xx, and releases the permit. State the same release for every path that does not start a write: door refusal, `Refuse`, budget expiry before a write. The permit sentence stays as it is for a write that has started.
+- Rewrite both capture tradeoffs against the deploy shape. TLS ends at the proxy; the relay's socket is loopback. The proxy is inside the secret's lifetime: it must be unable to retain `Authorization` and unable to retain raw bodies. GitHub's missing signed time means a retained body stays admissible forever; Slack's window is what makes the same log line harmless five minutes later. Leave Nick's decision in place: Teams approvals still rest on that secret staying private, owners still `teams_module` and `agent_loop`. Delete "the trust rule above."
