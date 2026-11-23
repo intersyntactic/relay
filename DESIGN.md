@@ -152,12 +152,14 @@ rest on it.
   of it. The protocol doesn't let a relay close that. Mitigations: TLS to
   the relay, the token's short life, and the trust rule above. This is the
   first question for the Fable audit.
-- **Approvals through Teams rest on the token staying private** (decision:
-  Nick). `ShownMessageJudged.from` becomes NodeApproval/NodeCorrection in
-  agent_loop, and `MessageChanged.from` drives withdrawal. With a captured
-  token, both can name anyone. Either accept that (capture needs a TLS break
-  between Microsoft and the relay, and the token expires), or make a
-  sender-only source unable to emit them, which ends approvals from Teams.
+- **Approvals through Teams rest on the token staying private** (accepted by
+  Nick, 2026-11-24; owners: teams_module and agent_loop).
+  `ShownMessageJudged.from` becomes NodeApproval/NodeCorrection in agent_loop,
+  and `MessageChanged.from` drives withdrawal. With a captured token, both
+  can name anyone. Accepted because a capture needs a TLS break between
+  Microsoft and the relay, and the token expires. The alternative, stopping
+  a sender-only source from emitting them, would end approvals from Teams.
+  This is the Fable audit's first target.
 - **Replays and floods each write a permanent entry** (owner: is_relay).
   With `at` in every body, each exact replay is a new entry, and a captured
   Teams token can write distinct ones. The logbook only grows. A coarse
@@ -209,5 +211,3 @@ each relay that uses it, plus one on every release.
 1. Are Teams resends byte-identical? Not needed for correctness any more,
    but it decides whether the storage optimisation helps Teams.
 
-2. Teams approvals under a captured token: accept, or stop sender-only
-   sources emitting approvals? (Nick; see "Named tradeoffs".)
