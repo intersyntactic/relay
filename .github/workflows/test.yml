@@ -1,0 +1,30 @@
+name: test
+
+# On both hosts, because the tests drive dart:io's HTTP server and sockets,
+# whose edge cases (a dropped connection, a detached socket) can differ.
+# Weekly as well, because what the tests check can break with no change
+# here: a new runner image or a new Dart SDK.
+# The publish dry run catches a package pub.dev would refuse before a release.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 20 * * 0'
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+      - run: dart pub get
+      - run: dart analyze --fatal-infos
+      - run: dart test
+      - run: dart pub publish --dry-run
