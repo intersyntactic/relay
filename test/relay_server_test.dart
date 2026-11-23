@@ -37,28 +37,103 @@ final class _TestCheck implements ChecksDeliveries<String> {
   }
 }
 
-final class _Write {
-  final calls = <(Kind, List<int>, Duration)>[];
-  WriteResult Function() answer = () => Written(ObjectId.of(Uint8List(1)));
-  Completer<void>? hold;
+/// How the fake logbook answers a write.
+enum _Answer { ok, duplicate, refusedKind, failed, notTip, silent }
 
-  /// Completes when the first write arrives.
+/// A logbook write service on a Unix socket, speaking its wire protocol:
+/// the request `<kind>\n<previous>\n<body>` to the end of the stream, then
+/// one line back naming the request's hash.
+final class _FakeLogbook {
+  _FakeLogbook._(this._server, this.socket, this._dir);
+
+  static Future<_FakeLogbook> start() async {
+    final dir = await Directory.systemTemp.createTemp('relay');
+    final path = '${dir.path}/w.sock';
+    final server = await ServerSocket.bind(
+      InternetAddress(path, type: InternetAddressType.unix),
+      0,
+    );
+    final logbook = _FakeLogbook._(server, LogbookSocket.parse(path)!, dir);
+    server.listen(logbook._serve);
+    return logbook;
+  }
+
+  final ServerSocket _server;
+  final Directory _dir;
+  final LogbookSocket socket;
+  final _open = <Socket>[];
+
+  _Answer answer = _Answer.ok;
+
+  /// Each request, in full, as it arrived.
+  final requests = <Uint8List>[];
+
+  /// Completes when the first request has arrived.
   final called = Completer<void>();
 
-  Future<WriteResult> call(Kind kind, List<int> body, Duration timeout) async {
-    calls.add((kind, body, timeout));
+  /// While set, no answer is sent until it completes.
+  Completer<void>? hold;
+
+  Future<void> _serve(Socket s) async {
+    _open.add(s);
+    final b = BytesBuilder();
+    try {
+      await s.forEach(b.add);
+    } on SocketException {
+      return;
+    }
+    final request = b.takeBytes();
+    requests.add(request);
     if (!called.isCompleted) called.complete();
     await hold?.future;
-    return answer();
+    final id = ObjectId.of(request).hex;
+    final line = switch (answer) {
+      _Answer.ok => 'ok $id',
+      _Answer.duplicate => 'refused duplicate $id',
+      _Answer.refusedKind => 'refused kind not allowed',
+      _Answer.failed => 'failed disk',
+      _Answer.notTip => 'refused not-tip ${ObjectId.of(Uint8List(2)).hex}',
+      _Answer.silent => null,
+    };
+    if (line == null) return;
+    try {
+      s.write('$line\n');
+      await s.close();
+    } on SocketException {
+      // The relay gave up and destroyed its end.
+    }
+  }
+
+  /// The entry's kind and body, read back from [request].
+  static (Kind, Uint8List) parse(Uint8List request) {
+    final first = request.indexOf(0x0a);
+    final second = request.indexOf(0x0a, first + 1);
+    return (
+      Kind.parse(utf8.decode(request.sublist(0, first)))!,
+      Uint8List.sublistView(request, second + 1),
+    );
+  }
+
+  bool _stopped = false;
+
+  Future<void> stop() async {
+    if (_stopped) return;
+    _stopped = true;
+    for (final s in _open) {
+      s.destroy();
+    }
+    await _server.close();
+    await _dir.delete(recursive: true);
   }
 }
 
 void main() {
   late HttpServer server;
   late _TestCheck check;
-  late _Write write;
+  late _FakeLogbook logbook;
   late List<String> logged;
   late Uri url;
+  var started = false;
 
   Future<void> start({
     Duration budget = const Duration(seconds: 2),
@@ -66,15 +141,16 @@ void main() {
     int maxBodyBytes = 1024,
     int maxInFlight = 8,
   }) async {
+    started = true;
     check = _TestCheck();
-    write = _Write();
+    logbook = await _FakeLogbook.start();
     logged = [];
     server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     url = Uri.parse('http://127.0.0.1:${server.port}/in');
     unawaited(
       RelayServer(
         check: check,
-        write: write.call,
+        logbook: logbook.socket,
         path: RelayPath.parse('/in')!,
         budget: budget,
         rate: WriteRateBound(perMinute: 1, burst: burst),
@@ -85,18 +161,18 @@ void main() {
     );
   }
 
-  tearDown(() => server.close(force: true));
+  tearDown(() async {
+    if (!started) return;
+    started = false;
+    await server.close(force: true);
+    await logbook.stop();
+  });
 
-  Future<(int, String)> post(
-    String body, {
-    String key = 'good',
-    Uri? to,
-    String method = 'POST',
-  }) async {
+  Future<(int, String)> post(String body) async {
     final client = HttpClient();
     try {
-      final req = await client.openUrl(method, to ?? url);
-      req.headers.set('x-test-key', key);
+      final req = await client.postUrl(url);
+      req.headers.set('x-test-key', 'good');
       req.write(body);
       final res = await req.close();
       return (res.statusCode, await utf8.decodeStream(res));
@@ -112,26 +188,33 @@ void main() {
     String method = 'POST',
     String path = '/in',
     String key = 'good',
-    String headers = '',
     String body = 'x',
     int? declaredLength,
-    bool closeAfterSending = false,
   }) async {
     final socket = await Socket.connect(
       InternetAddress.loopbackIPv4,
       server.port,
     );
     socket.write(
-      '$method $path HTTP/1.1\r\nhost: x\r\nx-test-key: $key\r\n$headers'
+      '$method $path HTTP/1.1\r\nhost: x\r\nx-test-key: $key\r\n'
+      'connection: close\r\n'
       'content-length: ${declaredLength ?? body.length}\r\n\r\n$body',
     );
-    if (closeAfterSending) {
-      await socket.flush();
-      socket.destroy();
-      return -1;
-    }
-    final answer = await utf8.decodeStream(socket);
-    return int.parse(answer.split(' ')[1]);
+    // Read to the end; a reset after the status line (the relay destroys the
+    // socket with the body unread) ends the read like a close.
+    final received = BytesBuilder();
+    final done = Completer<void>();
+    socket.listen(
+      received.add,
+      onDone: done.complete,
+      onError: (Object _) {
+        if (!done.isCompleted) done.complete();
+      },
+      cancelOnError: true,
+    );
+    await done.future;
+    socket.destroy();
+    return int.parse(utf8.decode(received.takeBytes()).split(' ')[1]);
   }
 
   group('records, then answers', () {
@@ -143,36 +226,31 @@ void main() {
         final (status, body) = await post('hello');
         expect(status, 200);
         expect(jsonDecode(body), {'ok': 'good'});
-        expect(write.calls, hasLength(1));
-        final (kind, entry, _) = write.calls.single;
+        final (kind, entry) = _FakeLogbook.parse(logbook.requests.single);
         expect(kind.name, 'test-event');
-        final event = RelayedEvent.read(
-          ObjectId.of(Uint8List(1)),
-          kind,
-          Uint8List.fromList(entry),
-        );
+        final event = RelayedEvent.read(ObjectId.of(Uint8List(1)), kind, entry);
         expect(utf8.decode(event!.bytes), 'hello');
       },
     );
 
     test('already recorded is also a 200', () async {
-      write.answer = () => AlreadyRecorded(ObjectId.of(Uint8List(1)));
+      logbook.answer = _Answer.duplicate;
       expect((await post('again')).$1, 200);
     });
 
-    for (final (name, result) in [
-      ('failed', const WriteFailed('disk')),
-      ('refused', const WriteRefused('kind')),
-      ('unanswered', const Unanswered('gone')),
+    for (final answer in [
+      _Answer.failed,
+      _Answer.refusedKind,
+      _Answer.notTip,
     ]) {
-      test('a write that is $name is a 503 with no response body', () async {
-        write.answer = () => result;
+      test('a write answered ${answer.name} is a 503, no body', () async {
+        logbook.answer = answer;
         expect(await post('x'), (503, ''));
       });
     }
 
-    test('not-tip is a 503', () async {
-      write.answer = () => NotTip(ObjectId.of(Uint8List(2)));
+    test('no logbook listening is a 503', () async {
+      await File(logbook.socket.path).delete();
       expect((await post('x')).$1, 503);
     });
 
@@ -184,7 +262,7 @@ void main() {
     test('a duplicate is written again: no seen set', () async {
       await post('same');
       await post('same');
-      expect(write.calls, hasLength(2));
+      expect(logbook.requests, hasLength(2));
     });
   });
 
@@ -193,29 +271,27 @@ void main() {
 
     test('a header refusal answers its status and writes nothing', () async {
       expect(await rawStatus(key: 'bad'), 401);
-      expect(write.calls, isEmpty);
+      expect(logbook.requests, isEmpty);
       expect(check.seenBodies, isEmpty);
       expect(logged.single, contains('401 bad key'));
     });
 
     test('a body refusal answers its status and writes nothing', () async {
-      expect((await post('refuse')).$1, 403);
-      expect(write.calls, isEmpty);
+      expect(await rawStatus(body: 'refuse'), 403);
+      expect(logbook.requests, isEmpty);
     });
 
     test('another path is 404', () async {
       expect(await rawStatus(path: '/else'), 404);
-      expect(write.calls, isEmpty);
     });
 
     test('another method is 405', () async {
       expect(await rawStatus(method: 'PUT'), 405);
-      expect(write.calls, isEmpty);
     });
 
     test('a declared length over the cap is 413', () async {
       expect(await rawStatus(body: 'x' * 2000), 413);
-      expect(write.calls, isEmpty);
+      expect(logbook.requests, isEmpty);
     });
 
     test(
@@ -227,15 +303,24 @@ void main() {
           await rawStatus(key: 'throw', body: '', declaredLength: 10),
           500,
         );
-        expect(write.calls, isEmpty);
+        expect(logbook.requests, isEmpty);
       },
     );
 
     test('a sender gone mid-body leaves the relay serving', () async {
-      await rawStatus(body: 'ab', declaredLength: 10, closeAfterSending: true);
+      final socket = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        server.port,
+      );
+      socket.write(
+        'POST /in HTTP/1.1\r\nhost: x\r\nx-test-key: good\r\n'
+        'content-length: 10\r\n\r\nab',
+      );
+      await socket.flush();
+      socket.destroy();
       await Future<void>.delayed(const Duration(milliseconds: 100));
       expect((await post('after')).$1, 200);
-      expect(write.calls, hasLength(1));
+      expect(logbook.requests, hasLength(1));
     });
   });
 
@@ -244,36 +329,39 @@ void main() {
       await start(burst: 1);
       expect((await post('one')).$1, 200);
       expect((await post('two')).$1, 429);
-      expect(write.calls, hasLength(1));
+      expect(logbook.requests, hasLength(1));
     });
 
     test('is not spent by deliveries that fail the check', () async {
       await start(burst: 1);
-      await post('x', key: 'bad');
-      await post('refuse');
+      await rawStatus(key: 'bad');
+      await rawStatus(body: 'refuse');
       expect((await post('one')).$1, 200);
     });
 
     test('is given back when the write certainly did not record', () async {
       await start(burst: 1);
-      write.answer = () => const WriteRefused('kind');
+      logbook.answer = _Answer.refusedKind;
       expect((await post('one')).$1, 503);
-      write.answer = () => Written(ObjectId.of(Uint8List(1)));
+      logbook.answer = _Answer.ok;
       expect((await post('one')).$1, 200);
     });
 
-    for (final (name, result) in [
-      ('unanswered', const Unanswered('down')),
-      ('failed partway', const WriteFailed('disk')),
-    ]) {
-      test('stays spent when the write was $name: it may be in', () async {
-        await start(burst: 1);
-        write.answer = () => result;
-        expect((await post('one')).$1, 503);
-        write.answer = () => Written(ObjectId.of(Uint8List(1)));
-        expect((await post('two')).$1, 429);
-      });
-    }
+    test('stays spent when the write failed partway: it may be in', () async {
+      await start(burst: 1);
+      logbook.answer = _Answer.failed;
+      expect((await post('one')).$1, 503);
+      logbook.answer = _Answer.ok;
+      expect((await post('two')).$1, 429);
+    });
+
+    test('stays spent when the write went unanswered', () async {
+      await start(budget: const Duration(milliseconds: 300), burst: 1);
+      logbook.answer = _Answer.silent;
+      expect((await post('one')).$1, 503);
+      logbook.answer = _Answer.ok;
+      expect((await post('two')).$1, 429);
+    });
 
     test('refills by elapsed time, not the wall clock', () {
       var elapsed = Duration.zero;
@@ -291,33 +379,10 @@ void main() {
 
   test('a reason cannot start a log line of its own', () async {
     await start();
-    await post('x', key: 'bad');
-    final check = _TestCheck();
-    final lines = <String>[];
-    final relay = RelayServer(
-      check: check,
-      write: write.call,
-      path: RelayPath.parse('/in')!,
-      budget: const Duration(seconds: 1),
-      rate: WriteRateBound(perMinute: 1, burst: 1),
-      log: lines.add,
-    );
-    final other = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
-    unawaited(relay.serve(other));
     check.reason = 'tenant a\nforged line';
-    final client = HttpClient();
-    try {
-      final req = await client.post('127.0.0.1', other.port, '/in');
-      req.headers.set('x-test-key', 'bad');
-      await (await req.close()).drain<void>();
-    } on HttpException {
-      // Dropped unread; the log line is what's checked.
-    } finally {
-      client.close(force: true);
-      await other.close(force: true);
-    }
-    expect(lines.single, isNot(contains('\n')));
-    expect(lines.single, contains(r'tenant a\x0aforged line'));
+    await rawStatus(key: 'bad');
+    expect(logged.single, isNot(contains('\n')));
+    expect(logged.single, contains(r'tenant a\x0aforged line'));
   });
 
   test('a path is a slash and no whitespace or query', () {
@@ -336,54 +401,39 @@ void main() {
   });
 
   group('the budget', () {
-    test('a write slower than the budget is a 503, in time', () async {
+    test('a logbook that never answers is a 503, in time', () async {
       await start(budget: const Duration(milliseconds: 300));
-      write.hold = Completer();
+      logbook.answer = _Answer.silent;
       final clock = Stopwatch()..start();
       expect((await post('slow')).$1, 503);
       expect(clock.elapsed, lessThan(const Duration(seconds: 2)));
-      final (_, _, timeout) = write.calls.single;
-      expect(timeout, lessThanOrEqualTo(const Duration(milliseconds: 300)));
-      write.hold!.complete();
     });
 
     test('a body trickled past the budget is refused', () async {
       await start(budget: const Duration(milliseconds: 300));
-      final socket = await Socket.connect(
-        InternetAddress.loopbackIPv4,
-        server.port,
-      );
-      socket.write(
-        'POST /in HTTP/1.1\r\nhost: x\r\nx-test-key: good\r\n'
-        'content-length: 10\r\n\r\nab',
-      );
-      final answer = await utf8.decodeStream(socket);
-      expect(answer, startsWith('HTTP/1.1 408'));
-      expect(write.calls, isEmpty);
+      expect(await rawStatus(body: 'ab', declaredLength: 10), 408);
+      expect(logbook.requests, isEmpty);
+    });
+
+    test('nothing a request starts holds its place past the budget', () async {
+      await start(budget: const Duration(milliseconds: 300), maxInFlight: 1);
+      logbook.answer = _Answer.silent;
+      expect((await post('slow')).$1, 503);
+      // The silent write ended with the budget, so the place is free.
+      logbook.answer = _Answer.ok;
+      expect((await post('after')).$1, 200);
     });
   });
 
-  test('the in-flight cap counts a request until its write settles', () async {
+  test('the in-flight cap counts a request until it is answered', () async {
     await start(maxInFlight: 1);
-    write.hold = Completer();
+    logbook.hold = Completer();
     final first = post('first');
-    await write.called.future;
-    expect(await rawStatus(), 503);
-    write.hold!.complete();
-    expect((await first).$1, 200);
-    expect((await post('third')).$1, 200);
-  });
-
-  test('a write past the budget keeps its place until it settles', () async {
-    await start(budget: const Duration(milliseconds: 200), maxInFlight: 1);
-    write.hold = Completer();
-    // Answered 503 when the budget ends, but the write is still running.
-    expect((await post('slow')).$1, 503);
+    await logbook.called.future;
     expect(await rawStatus(), 503);
     expect(logged.last, contains('busy'));
-    write.hold!.complete();
-    await Future<void>.delayed(const Duration(milliseconds: 50));
-    write.hold = null;
-    expect((await post('after')).$1, 200);
+    logbook.hold!.complete();
+    expect((await first).$1, 200);
+    expect((await post('third')).$1, 200);
   });
 }

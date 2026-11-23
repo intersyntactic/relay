@@ -29,7 +29,7 @@ final class SlackCheck implements ChecksDeliveries<SlackSignature> {
 final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 8090);
 await RelayServer(
   check: SlackCheck(...),
-  write: writerAt('/run/logbook/write.sock'),
+  logbook: LogbookSocket.parse('/run/logbook/write.sock')!,
   path: RelayPath.parse('/slack/events')!,
   budget: const Duration(milliseconds: 2500), // inside Slack's 3 s
   rate: WriteRateBound(perMinute: 600, burst: 60),

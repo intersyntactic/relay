@@ -220,11 +220,16 @@ timeout and connection limits are the bound.
 
 `RelayServer`: listens on loopback (default 127.0.0.1, port from config)
 behind the TLS proxy, one path, POST only. It takes a `ChecksDeliveries`, the
-writer (a function, `LogbookWriter(path).write` by default, so tests pass a
-fake), a clock, the budget, the body cap, the cap on requests in flight
-(each held until its budget ends), the per-source write-rate bound, the key
-source if there is one, and a log. It logs one line per request: the status and the reason, never the
-content.
+logbook's write socket (a `LogbookSocket`), a clock, the budget, the body cap,
+the cap on requests in flight (each held until its budget ends), the
+per-source write-rate bound, and a log. It logs one line per request: the
+status and the reason, never the content.
+
+The relay writes through its own `LogbookWriter`, not an injected function.
+That writer's timeout is the budget remaining, and it destroys its socket
+when the timeout runs out, so no write outlives its request. An injected
+writer can't promise that. Tests run a fake logbook on a Unix socket that
+speaks the real wire protocol.
 
 No `/ws`, no `onEvent`. Those existed for when Intersyntactic ran on Nick's
 laptop.

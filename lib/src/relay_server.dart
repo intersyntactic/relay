@@ -15,19 +15,6 @@ import 'package:is_logbook_client/is_logbook_client.dart';
 import 'checks_deliveries.dart';
 import 'write_rate_bound.dart';
 
-/// Writes one entry to the logbook as a chain start, giving up after
-/// [timeout]. [writerAt] makes the real one.
-typedef WritesEntry = Future<WriteResult> Function(
-  Kind kind,
-  List<int> body,
-  Duration timeout,
-);
-
-/// The writer for the logbook service listening at [socket].
-WritesEntry writerAt(LogbookSocket socket) =>
-    (kind, body, timeout) =>
-        LogbookWriter(socket.path, timeout: timeout).write(kind, body);
-
 /// Where a logbook service's write socket is: an absolute filesystem path.
 final class LogbookSocket {
   const LogbookSocket._(this.path);
@@ -42,21 +29,39 @@ final class LogbookSocket {
   String toString() => path;
 }
 
+/// The one path a relay takes: starts with `/`, no whitespace, no query.
+final class RelayPath {
+  const RelayPath._(this.value);
+
+  /// [s] as a path, or null when it isn't one.
+  static RelayPath? parse(String s) =>
+      _form.hasMatch(s) ? RelayPath._(s) : null;
+
+  static final _form = RegExp(r'^/[^\s?#]*$');
+
+  /// The path, as a request's `uri.path` spells it.
+  final String value;
+
+  @override
+  String toString() => value;
+}
+
 /// The one endpoint a source posts to.
 ///
 /// Every request runs inside [budget], which must be shorter than the
 /// source's own deadline (Slack 3 s, Teams 15 s, GitHub 10 s). Nothing a
-/// request starts outlives it: the body read is cut off, and the write's
-/// timeout is what remains. A 2xx is sent only after the logbook says
-/// `Written` or `AlreadyRecorded`; everything else is a refusal, so the
-/// source can send it again.
+/// request starts outlives it: the body read is cut off, the logbook
+/// write's timeout is what remains (and the client destroys its socket
+/// then), and the answer has what remains to go out. A 2xx is sent only
+/// after the logbook says `Written` or `AlreadyRecorded`; everything else
+/// is a refusal, so the source can send it again.
 ///
 /// It keeps no record of what it has seen. A duplicate is written like any
 /// delivery; the docking station decides each `EventKey` once.
 final class RelayServer<V extends Object> {
   RelayServer({
     required this.check,
-    required this.write,
+    required this.logbook,
     required this.path,
     required this.budget,
     required this.rate,
@@ -67,7 +72,10 @@ final class RelayServer<V extends Object> {
   });
 
   final ChecksDeliveries<V> check;
-  final WritesEntry write;
+
+  /// The logbook service's write socket. The relay writes through its own
+  /// `LogbookWriter`, whose timeout ends every write inside the budget.
+  final LogbookSocket logbook;
 
   /// The only path taken, such as `/api/messages`.
   final RelayPath path;
@@ -80,8 +88,8 @@ final class RelayServer<V extends Object> {
 
   final int maxBodyBytes;
 
-  /// The most requests handled at once. Each holds its place until its
-  /// budget ends, so this bounds unfinished writes too.
+  /// The most requests handled at once. Nothing a request starts outlives
+  /// its budget, so this bounds all unfinished work.
   final int maxInFlight;
 
   /// One line per request: the status and why, never the content.
@@ -89,6 +97,10 @@ final class RelayServer<V extends Object> {
 
   final DateTime Function() _now;
   int _inFlight = 0;
+
+  /// The least time an answer is given to go out, even when the budget is
+  /// all but spent: a refusal nobody receives makes no one retry sooner.
+  static const _leastToAnswer = Duration(milliseconds: 250);
 
   /// Serves [server] until it closes, each request on its own.
   ///
@@ -101,31 +113,41 @@ final class RelayServer<V extends Object> {
 
   /// Handles one request.
   Future<void> handle(HttpRequest req) async {
-    if (_inFlight >= maxInFlight) {
-      return _refuseUnread(req, RefusalStatus.serviceUnavailable, 'busy');
+    final clock = Stopwatch()..start();
+    Duration left() {
+      final rest = budget - clock.elapsed;
+      return rest < _leastToAnswer ? _leastToAnswer : rest;
     }
-    _inFlight++;
+
+    final full = _inFlight >= maxInFlight;
+    if (!full) _inFlight++;
     try {
-      await _handle(req, Stopwatch()..start());
+      await (full
+          ? _refuseUnread(req, RefusalStatus.serviceUnavailable, 'busy', left)
+          : _handle(req, clock, left));
     } on Exception catch (e) {
       // Only answering can throw here, on a connection the sender already
-      // closed: there is no one left to answer.
-      _log(0, 'answer not sent: ${e.runtimeType}');
+      // closed or stopped reading: there is no one left to answer.
+      log('${check.source} relay: answer not sent: ${e.runtimeType}');
     } finally {
-      _inFlight--;
+      if (!full) _inFlight--;
     }
   }
 
-  Future<void> _handle(HttpRequest req, Stopwatch clock) async {
+  Future<void> _handle(
+    HttpRequest req,
+    Stopwatch clock,
+    Duration Function() left,
+  ) async {
     // wire-ok: the HTTP method, checked against the one we accept.
     if (req.method != 'POST') {
-      return _refuseUnread(req, RefusalStatus.methodNotAllowed, 'method');
+      return _refuseUnread(req, RefusalStatus.methodNotAllowed, 'method', left);
     }
     if (req.uri.path != path.value) {
-      return _refuseUnread(req, RefusalStatus.notFound, 'path');
+      return _refuseUnread(req, RefusalStatus.notFound, 'path', left);
     }
     if (req.contentLength > maxBodyBytes) {
-      return _refuseUnread(req, RefusalStatus.payloadTooLarge, 'length');
+      return _refuseUnread(req, RefusalStatus.payloadTooLarge, 'length', left);
     }
 
     final headers = <String, String>{};
@@ -140,12 +162,13 @@ final class RelayServer<V extends Object> {
         req,
         RefusalStatus.internalServerError,
         'header check threw ${e.runtimeType}',
+        left,
       );
     }
     final V vouched;
     switch (onHeaders) {
       case HeadersRefused(:final status, :final reason):
-        return _refuseUnread(req, status, reason);
+        return _refuseUnread(req, status, reason, left);
       case HeadersVouch(vouched: final v):
         vouched = v;
     }
@@ -153,11 +176,21 @@ final class RelayServer<V extends Object> {
     final Uint8List bytes;
     switch (await _read(req, budget - clock.elapsed)) {
       case _TooLarge():
-        return _refuseUnread(req, RefusalStatus.payloadTooLarge, 'body');
+        return _refuseUnread(req, RefusalStatus.payloadTooLarge, 'body', left);
       case _TooSlow():
-        return _refuseUnread(req, RefusalStatus.requestTimeout, 'body slow');
+        return _refuseUnread(
+          req,
+          RefusalStatus.requestTimeout,
+          'body slow',
+          left,
+        );
       case _Broken():
-        return _refuseUnread(req, RefusalStatus.badRequest, 'body broken');
+        return _refuseUnread(
+          req,
+          RefusalStatus.badRequest,
+          'body broken',
+          left,
+        );
       case _Read(bytes: final b):
         bytes = b;
     }
@@ -167,12 +200,12 @@ final class RelayServer<V extends Object> {
     try {
       verdict = check.checkBody(vouched, bytes.asUnmodifiableView());
     } on Exception catch (e) {
-      return _answer(req, 500, 'body check threw ${e.runtimeType}');
+      return _answer(req, 500, 'body check threw ${e.runtimeType}', left);
     }
     final Record record;
     switch (verdict) {
       case Refuse(:final status, :final reason):
-        return _answer(req, status.code, reason);
+        return _answer(req, status.code, reason, left);
       case final Record r:
         record = r;
     }
@@ -180,77 +213,60 @@ final class RelayServer<V extends Object> {
     // After the check, so only authentic deliveries spend the bound: an
     // unauthenticated sender can't use it up and shut out the source.
     if (!rate.take()) {
-      return _answer(req, RefusalStatus.tooManyRequests.code, 'rate bound');
+      return _answer(
+        req,
+        RefusalStatus.tooManyRequests.code,
+        'rate bound',
+        left,
+      );
     }
 
-    final (outcome, why, unsettled) = await _write(
-      bytes,
-      budget - clock.elapsed,
-    );
+    final (outcome, why) = await _write(bytes, budget - clock.elapsed);
     switch (outcome) {
       case _Outcome.recorded:
-        await _answer(req, 200, why, record.response);
+        return _answer(req, 200, why, left, record.response);
       case _Outcome.absent:
         // Certainly not in the logbook: give the room back, or an outage
         // would leave the bound spent on the retries.
         rate.giveBack();
-        await _answer(req, 503, why);
+        return _answer(req, 503, why, left);
       case _Outcome.unknown:
         // It may be in, so the room stays spent: the bound counts what
         // could be recorded, not what was confirmed.
-        await _answer(req, 503, why);
-    }
-    // A write the budget stopped waiting for still holds this request's
-    // place until it settles, so the in-flight cap counts unfinished writes.
-    if (unsettled != null) {
-      try {
-        await unsettled;
-      } on Exception {
-        // Already answered as unknown.
-      }
+        return _answer(req, 503, why, left);
     }
   }
 
-  /// Writes [bytes] within [remaining]: what became of it, why, and the
-  /// write itself when it was still running as the budget ended.
-  Future<(_Outcome, String, Future<WriteResult>?)> _write(
-    Uint8List bytes,
-    Duration remaining,
-  ) async {
+  /// Writes [bytes] within [remaining], and says what became of it.
+  ///
+  /// The relay's own `LogbookWriter` with [remaining] as its timeout: it
+  /// destroys its socket when that runs out, so the write ends with the
+  /// budget and nothing waits on it after.
+  Future<(_Outcome, String)> _write(Uint8List bytes, Duration remaining) async {
     if (remaining <= Duration.zero) {
-      return (_Outcome.absent, 'budget spent before write', null);
+      return (_Outcome.absent, 'budget spent before write');
     }
     final (kind, entry) = encodeRelayedEvent(
       check.source,
       at: _now().toUtc(),
       bytes: bytes,
     );
-    final pending = write(kind, entry, remaining);
-    final WriteResult result;
-    try {
-      result = await pending.timeout(remaining);
-    } on TimeoutException {
-      return (_Outcome.unknown, 'unanswered: budget spent', pending);
-    } on Exception catch (e) {
-      return (_Outcome.unknown, 'writer threw ${e.runtimeType}', null);
-    }
+    final result = await LogbookWriter(
+      logbook.path,
+      timeout: remaining,
+    ).write(kind, entry);
     return switch (result) {
-      Written(:final entry) => (
-        _Outcome.recorded,
-        'recorded ${entry.hex}',
-        null,
-      ),
+      Written(:final entry) => (_Outcome.recorded, 'recorded ${entry.hex}'),
       AlreadyRecorded(:final entry) => (
         _Outcome.recorded,
         'already ${entry.hex}',
-        null,
       ),
       // A chain start has no tip to be behind: the writer isn't one we know.
-      NotTip(:final tip) => (_Outcome.absent, 'not-tip ${tip.hex}', null),
-      WriteRefused(:final why) => (_Outcome.absent, 'refused $why', null),
+      NotTip(:final tip) => (_Outcome.absent, 'not-tip ${tip.hex}'),
+      WriteRefused(:final why) => (_Outcome.absent, 'refused $why'),
       // The writer's own words: failed partway, and may be in.
-      WriteFailed(:final why) => (_Outcome.unknown, 'failed $why', null),
-      Unanswered(:final why) => (_Outcome.unknown, 'unanswered $why', null),
+      WriteFailed(:final why) => (_Outcome.unknown, 'failed $why'),
+      Unanswered(:final why) => (_Outcome.unknown, 'unanswered $why'),
     };
   }
 
@@ -287,14 +303,21 @@ final class RelayServer<V extends Object> {
     return body;
   }
 
+  /// Answers a request whose body has been read. The response's deadline is
+  /// what remains of the budget: a sender that stops reading can't hold the
+  /// request past it. (Not set earlier: a deadline that fired during the
+  /// body read would destroy the socket under it.)
   Future<void> _answer(
     HttpRequest req,
     int status,
-    String reason, [
+    String reason,
+    Duration Function() left, [
     JsonObject? response,
   ]) async {
     _log(status, reason);
-    req.response.statusCode = status;
+    req.response
+      ..deadline = left()
+      ..statusCode = status;
     if (response != null) {
       req.response.headers.contentType = ContentType.json;
       req.response.write(jsonEncode(response));
@@ -305,11 +328,13 @@ final class RelayServer<V extends Object> {
   /// Answers [status] and drops the connection, leaving the rest of the
   /// body unread. dart:io's `response.close()` reads the whole request body
   /// before it sends a byte, so a refusal sent with it would still wait on
-  /// whatever the sender chooses to send.
+  /// whatever the sender chooses to send. The flush gets what remains of
+  /// the budget, and the socket is destroyed whatever it does.
   Future<void> _refuseUnread(
     HttpRequest req,
     RefusalStatus status,
     String reason,
+    Duration Function() left,
   ) async {
     _log(status.code, reason);
     req.response
@@ -317,8 +342,13 @@ final class RelayServer<V extends Object> {
       ..persistentConnection = false
       ..contentLength = 0;
     final socket = await req.response.detachSocket();
-    await socket.flush();
-    socket.destroy();
+    try {
+      await socket.flush().timeout(left());
+    } on TimeoutException {
+      // The sender isn't reading; it gets no answer, as a dropped one.
+    } finally {
+      socket.destroy();
+    }
   }
 
   /// One line per request. A reason can carry what a sender sent (a header
@@ -332,23 +362,6 @@ final class RelayServer<V extends Object> {
   static final _control = RegExp(r'[\x00-\x1f\x7f]');
 
   static void _stderr(String line) => stderr.writeln(line);
-}
-
-/// The one path a relay takes: starts with `/`, no whitespace, no query.
-final class RelayPath {
-  const RelayPath._(this.value);
-
-  /// [s] as a path, or null when it isn't one.
-  static RelayPath? parse(String s) =>
-      _form.hasMatch(s) ? RelayPath._(s) : null;
-
-  static final _form = RegExp(r'^/[^\s?#]*$');
-
-  /// The path, as a request's `uri.path` spells it.
-  final String value;
-
-  @override
-  String toString() => value;
 }
 
 sealed class _Body {

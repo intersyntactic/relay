@@ -4,6 +4,5 @@
 library;
 
 export 'src/checks_deliveries.dart';
-export 'src/relay_server.dart'
-    show LogbookSocket, RelayPath, RelayServer, WritesEntry, writerAt;
+export 'src/relay_server.dart' show LogbookSocket, RelayPath, RelayServer;
 export 'src/write_rate_bound.dart';
