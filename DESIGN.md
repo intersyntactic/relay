@@ -101,16 +101,27 @@ Coverage is a fixed fact of each source, so the entry's kind
 What matters is how the docking station reads it, and that goes in the
 translator contract:
 
-- A `teams-event` body's `from`, card values and invoke payloads are what a
-  captured-token holder can write. They are **testimony of the Bot Connector
-  session, not of the person named**. The verified facts are `addressedTo`
-  (the token's audience) and `replyEndpoint` (its service URL). Anything
-  that admits an approval or a close on `from` accepts that trust model, and
-  has to say so.
-- GitHub's uncovered context (the event kind) reaches the translator, if at
-  all, through a field named as unsigned. That field is a format question
-  for the docking station (open question 1). Until it's answered, the GitHub
-  translator classifies from the body.
+- In a genuine Teams activity, the Bot Connector sets `from` from the signed-in
+  user, so `from` and `addressedTo` are Microsoft's word. Card values and
+  invoke data, including the trajectory id a Close carries, are the user's
+  content. **With a captured token, all of it is the token holder's**: the
+  JWT doesn't bind the body, so `from` is no harder to forge than a card
+  value. The docking station's own decisions never read `from`. Downstream
+  readers do, in two places: `ShownMessageJudged.from` (who approved, turned
+  into NodeApproval/NodeCorrection in agent_loop) and the withdrawal rule
+  for `MessageChanged`. That approval path is the Fable audit's first
+  target.
+- GitHub's event kind reaches the translator through an optional
+  `"unverifiedHeaders": {"x-github-event": "issues"}` field: header names
+  lowercased, values as they came. A translator may use it only to choose
+  which body shape to read, and it gives `NothingToAdmit` when the signed
+  body doesn't parse as that shape. So a relabel can turn a signed event
+  into nothing, never into a different admitted event. And because GitHub's
+  `EventKey` is the sha256 of the bytes, a relabelled replay of a body
+  already relayed is a `DuplicateEvent`. This is a format change
+  (is_docking_station_api 0.5.0, every reader first), made only when the
+  GitHub relay is real. Until then the GitHub translator classifies from the
+  body.
 
 ## Storage
 
@@ -174,10 +185,8 @@ each relay that uses it, plus one on every release.
 
 ## Open questions
 
-1. GitHub's event kind: an optional, explicitly unsigned field in the
-   docking station's format, or classify from the body? (Asked of
-   docking-station-9b.)
-2. Does any admission rest on a Teams `from` in a way that matters? (Asked of
-   docking-station-9b. Also the audit's first question.)
-3. Are Teams resends byte-identical? Not needed for correctness any more,
+1. Are Teams resends byte-identical? Not needed for correctness any more,
    but it decides whether the storage optimisation helps Teams.
+
+(The GitHub event-kind field and Teams `from` were answered by
+docking-station-9b, 2026-11-24, and are folded in above.)
