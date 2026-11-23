@@ -9,7 +9,8 @@ is_relay holds what every relay shares. A relay package (`is_github_relay`,
 `is_slack_relay`, the Teams relay in `teams_module`) keeps only its source's
 check and its source's parse.
 
-Round 2, after the first strike (TEMPER.md, all four families RECAST).
+Round 3, after two strikes (TEMPER.md; all four families RECAST both
+times).
 
 ## What the relay owns, and what it doesn't
 
@@ -24,17 +25,26 @@ duplicate answered 200 from "seen" while the original's write was still
 pending could end the source's retries for an event that then failed to
 record. teams_relay has that race today.
 
-So is_relay has **no seen set and no replay key.** Every authentic delivery
-in the wake set is written, and answered on its own write. A duplicate costs
+So is_relay has **no seen set, no replay key and no wake filter.** Every
+authentic delivery is written and answered on its own write. Deciding what
+is worth acting on belongs to the translator, which returns `NothingToAdmit`
+for what it ignores. A duplicate costs
 one logbook entry, or none when its bytes match an earlier entry exactly
 (see "Storage").
 
 ## What a relay does, in order
 
 All of it runs inside **one monotonic budget per source**, shorter than the
-source's resend deadline: Slack's 3 s, Teams' 15 s, GitHub's 10 s. The body
-read, the check and the logbook write share it. The relay doesn't give each
-step its own timeout.
+source's resend deadline: Slack's 3 s, Teams' 15 s, GitHub's 10 s. Fetching
+keys (Teams), reading the body, the check and the logbook write all share
+it. The relay doesn't give each step its own timeout.
+
+A request holds its in-flight permit until its write **settles**, not until
+it answers: until the writer replies, or is_logbook_client's own timeout
+destroys the socket. When the budget runs out, the source gets a 5xx at
+once, but the permit stays held. So the in-flight cap bounds unfinished
+writes as well as open requests, and a slow logbook turns into refusals at
+the door, not a pile of orphaned writes.
 
 1. **Refuse at the door.** Wrong path or method, a declared length over the
    cap, too many requests in flight, or a header check that fails: answer and
@@ -49,9 +59,9 @@ step its own timeout.
 5. **Answer.** `Written` or `AlreadyRecorded` → 2xx, plus the source's fixed
    response body if it has one (a Teams invoke response, Slack's
    url_verification challenge). Anything else, or the budget running out →
-   5xx, so the source sends it again. When the budget runs out mid-write, the
-   write may still land. That's safe: the retry is `AlreadyRecorded` or a
-   second entry with the same `EventKey`.
+   5xx, so the source sends it again. A write that lands after its 5xx
+   leaves a second entry with the same `EventKey` when the retry lands too.
+   The docking station decides it once.
 
 is_relay owns every step and the order. The source supplies only the check.
 
@@ -69,9 +79,13 @@ abstract interface class ChecksDeliveries<V extends Object> {
 
 sealed class BodyVerdict {}
 final class Record extends BodyVerdict { final JsonObject? response; }
-final class Answer extends BodyVerdict { final JsonObject? response; }  // authentic, not recorded
+final class Handshake extends BodyVerdict { final JsonObject response; }
 final class Refuse extends BodyVerdict { final int status; final String reason; }
 ```
+
+`Handshake` is for a protocol exchange that carries no event, such as
+Slack's `url_verification`. It is answered and not recorded. It isn't a way
+to skip "quiet" events: an authentic event is always `Record`.
 
 The check returns a verdict. It doesn't return bytes. On `Record`, the
 relay writes **the snapshot it read and handed to the check**. Nothing else
@@ -80,13 +94,10 @@ the snapshot. No source package can hand it different bytes. That isn't a
 proof the check did its cryptography right. That's what review and the
 audit are for.
 
-**The wake decision reads only what the check covers.** GitHub's HMAC covers
-the body and nothing else, and `X-GitHub-Event` is a header. A filter on
-that header lets a replayer relabel a signed body (`webhook_gate.dart` says
-so). So the GitHub relay records every HMAC-valid delivery and leaves
-classification to the translator. Slack's event type is inside the signed
-bytes, so a Slack filter is fine. Teams' type is in the body, which only the
-token vouches for (next section).
+With no wake filter, nothing in the relay reads uncovered data to decide
+anything. That matters for GitHub. `X-GitHub-Event` is a header outside the
+HMAC, and a filter on it would let a replayer relabel a signed body
+(`webhook_gate.dart` says so).
 
 ## What a check vouches for
 
@@ -111,17 +122,14 @@ translator contract:
   into NodeApproval/NodeCorrection in agent_loop) and the withdrawal rule
   for `MessageChanged`. That approval path is the Fable audit's first
   target.
-- GitHub's event kind reaches the translator through an optional
-  `"unverifiedHeaders": {"x-github-event": "issues"}` field: header names
-  lowercased, values as they came. A translator may use it only to choose
-  which body shape to read, and it gives `NothingToAdmit` when the signed
-  body doesn't parse as that shape. So a relabel can turn a signed event
-  into nothing, never into a different admitted event. And because GitHub's
-  `EventKey` is the sha256 of the bytes, a relabelled replay of a body
-  already relayed is a `DuplicateEvent`. This is a format change
-  (is_docking_station_api 0.5.0, every reader first), made only when the
-  GitHub relay is real. Until then the GitHub translator classifies from the
-  body.
+- GitHub's event kind is **not recorded**. The translator classifies from
+  the signed body alone, and a body that isn't unambiguously one shape it
+  knows is `NothingToAdmit`. `issues` and `issue_comment` both carry
+  `issue`, so "unambiguously" is part of the job. A label in the record
+  would let whatever arrived first choose the meaning, and no proof that the
+  parsers are disjoint would be worth the format change. `NothingToAdmit`
+  carries no `EventKey`, so a delivery that admitted nothing consumes
+  nothing.
 
 ## Storage
 
@@ -144,6 +152,18 @@ rest on it.
   of it. The protocol doesn't let a relay close that. Mitigations: TLS to
   the relay, the token's short life, and the trust rule above. This is the
   first question for the Fable audit.
+- **Approvals through Teams rest on the token staying private** (decision:
+  Nick). `ShownMessageJudged.from` becomes NodeApproval/NodeCorrection in
+  agent_loop, and `MessageChanged.from` drives withdrawal. With a captured
+  token, both can name anyone. Either accept that (capture needs a TLS break
+  between Microsoft and the relay, and the token expires), or make a
+  sender-only source unable to emit them, which ends approvals from Teams.
+- **Replays and floods each write a permanent entry** (owner: is_relay).
+  With `at` in every body, each exact replay is a new entry, and a captured
+  Teams token can write distinct ones. The logbook only grows. A coarse
+  per-source write-rate bound in `RelayServer` caps both. Bytes-only bodies
+  would make exact replays free, but they stay an optimisation (see
+  "Storage").
 - **GitHub has no signed time** (owner: is_relay). A captured body that was
   never delivered to us is accepted once. One that was delivered is a no-op,
   because its `EventKey` is the sha256 of its bytes. Capturing one needs a
@@ -154,8 +174,9 @@ rest on it.
 `RelayServer`: listens on loopback (default 127.0.0.1, port from config)
 behind the TLS proxy, one path, POST only. It takes a `ChecksDeliveries`, the
 writer (a function, `LogbookWriter(path).write` by default, so tests pass a
-fake), a clock, the budget, the body cap, the cap on requests in flight, and
-a log. It logs one line per request: the status and the reason, never the
+fake), a clock, the budget, the body cap, the cap on requests in flight
+(held until each write settles), the per-source write-rate bound, and a
+log. It logs one line per request: the status and the reason, never the
 content.
 
 No `/ws`, no `onEvent`. Those existed for when Intersyntactic ran on Nick's
@@ -188,5 +209,5 @@ each relay that uses it, plus one on every release.
 1. Are Teams resends byte-identical? Not needed for correctness any more,
    but it decides whether the storage optimisation helps Teams.
 
-(The GitHub event-kind field and Teams `from` were answered by
-docking-station-9b, 2026-11-24, and are folded in above.)
+2. Teams approvals under a captured token: accept, or stop sender-only
+   sources emitting approvals? (Nick; see "Named tradeoffs".)
