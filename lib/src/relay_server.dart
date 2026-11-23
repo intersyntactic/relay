@@ -23,10 +23,24 @@ typedef WritesEntry = Future<WriteResult> Function(
   Duration timeout,
 );
 
-/// The writer for the logbook service at [socketPath].
-WritesEntry writerAt(String socketPath) =>
+/// The writer for the logbook service listening at [socket].
+WritesEntry writerAt(LogbookSocket socket) =>
     (kind, body, timeout) =>
-        LogbookWriter(socketPath, timeout: timeout).write(kind, body);
+        LogbookWriter(socket.path, timeout: timeout).write(kind, body);
+
+/// Where a logbook service's write socket is: an absolute filesystem path.
+final class LogbookSocket {
+  const LogbookSocket._(this.path);
+
+  /// [s] as a socket path, or null when it isn't an absolute path.
+  static LogbookSocket? parse(String s) =>
+      s.startsWith('/') && !s.contains('\x00') ? LogbookSocket._(s) : null;
+
+  final String path;
+
+  @override
+  String toString() => path;
+}
 
 /// The one endpoint a source posts to.
 ///
@@ -94,12 +108,9 @@ final class RelayServer<V extends Object> {
     try {
       await _handle(req, Stopwatch()..start());
     } on Exception catch (e) {
-      _log(500, '${e.runtimeType}');
-      try {
-        await _end(req, 500);
-      } on Exception {
-        // The response was already under way; there is no one left to tell.
-      }
+      // Only answering can throw here, on a connection the sender already
+      // closed: there is no one left to answer.
+      _log(0, 'answer not sent: ${e.runtimeType}');
     } finally {
       _inFlight--;
     }
@@ -119,8 +130,20 @@ final class RelayServer<V extends Object> {
 
     final headers = <String, String>{};
     req.headers.forEach((name, values) => headers[name] = values.join(','));
+    final HeaderCheck<V> onHeaders;
+    try {
+      onHeaders = check.checkHeaders(DeliveryHeaders(headers), _now());
+    } on Exception catch (e) {
+      // Unread like every other refusal before the body: answering with
+      // `close()` would wait on whatever body the sender chooses to send.
+      return _refuseUnread(
+        req,
+        RefusalStatus.internalServerError,
+        'header check threw ${e.runtimeType}',
+      );
+    }
     final V vouched;
-    switch (check.checkHeaders(DeliveryHeaders(headers), _now())) {
+    switch (onHeaders) {
       case HeadersRefused(:final status, :final reason):
         return _refuseUnread(req, status, reason);
       case HeadersVouch(vouched: final v):
@@ -133,11 +156,19 @@ final class RelayServer<V extends Object> {
         return _refuseUnread(req, RefusalStatus.payloadTooLarge, 'body');
       case _TooSlow():
         return _refuseUnread(req, RefusalStatus.requestTimeout, 'body slow');
+      case _Broken():
+        return _refuseUnread(req, RefusalStatus.badRequest, 'body broken');
       case _Read(bytes: final b):
         bytes = b;
     }
 
-    final verdict = check.checkBody(vouched, bytes.asUnmodifiableView());
+    // From here the body is read, so `close()` has nothing left to wait on.
+    final BodyVerdict verdict;
+    try {
+      verdict = check.checkBody(vouched, bytes.asUnmodifiableView());
+    } on Exception catch (e) {
+      return _answer(req, 500, 'body check threw ${e.runtimeType}');
+    }
     final Record record;
     switch (verdict) {
       case Refuse(:final status, :final reason):
@@ -152,42 +183,74 @@ final class RelayServer<V extends Object> {
       return _answer(req, RefusalStatus.tooManyRequests.code, 'rate bound');
     }
 
-    final (recorded, why) = await _write(bytes, budget - clock.elapsed);
-    if (!recorded) {
-      // Not recorded, so the source will send it again: the room it took is
-      // given back, or an outage would leave the bound spent on retries.
-      rate.giveBack();
-      return _answer(req, 503, why);
+    final (outcome, why, unsettled) = await _write(
+      bytes,
+      budget - clock.elapsed,
+    );
+    switch (outcome) {
+      case _Outcome.recorded:
+        await _answer(req, 200, why, record.response);
+      case _Outcome.absent:
+        // Certainly not in the logbook: give the room back, or an outage
+        // would leave the bound spent on the retries.
+        rate.giveBack();
+        await _answer(req, 503, why);
+      case _Outcome.unknown:
+        // It may be in, so the room stays spent: the bound counts what
+        // could be recorded, not what was confirmed.
+        await _answer(req, 503, why);
     }
-    return _answer(req, 200, why, record.response);
+    // A write the budget stopped waiting for still holds this request's
+    // place until it settles, so the in-flight cap counts unfinished writes.
+    if (unsettled != null) {
+      try {
+        await unsettled;
+      } on Exception {
+        // Already answered as unknown.
+      }
+    }
   }
 
-  /// Writes [bytes] within [remaining]. True when the logbook holds the
-  /// entry, whether written now or already there.
-  Future<(bool recorded, String why)> _write(
+  /// Writes [bytes] within [remaining]: what became of it, why, and the
+  /// write itself when it was still running as the budget ended.
+  Future<(_Outcome, String, Future<WriteResult>?)> _write(
     Uint8List bytes,
     Duration remaining,
   ) async {
-    if (remaining <= Duration.zero) return (false, 'budget spent before write');
+    if (remaining <= Duration.zero) {
+      return (_Outcome.absent, 'budget spent before write', null);
+    }
     final (kind, entry) = encodeRelayedEvent(
       check.source,
       at: _now().toUtc(),
       bytes: bytes,
     );
+    final pending = write(kind, entry, remaining);
     final WriteResult result;
     try {
-      result = await write(kind, entry, remaining).timeout(remaining);
+      result = await pending.timeout(remaining);
     } on TimeoutException {
-      return (false, 'unanswered: budget spent');
+      return (_Outcome.unknown, 'unanswered: budget spent', pending);
+    } on Exception catch (e) {
+      return (_Outcome.unknown, 'writer threw ${e.runtimeType}', null);
     }
     return switch (result) {
-      Written(:final entry) => (true, 'recorded ${entry.hex}'),
-      AlreadyRecorded(:final entry) => (true, 'already ${entry.hex}'),
+      Written(:final entry) => (
+        _Outcome.recorded,
+        'recorded ${entry.hex}',
+        null,
+      ),
+      AlreadyRecorded(:final entry) => (
+        _Outcome.recorded,
+        'already ${entry.hex}',
+        null,
+      ),
       // A chain start has no tip to be behind: the writer isn't one we know.
-      NotTip(:final tip) => (false, 'not-tip ${tip.hex}'),
-      WriteRefused(:final why) => (false, 'refused $why'),
-      WriteFailed(:final why) => (false, 'failed $why'),
-      Unanswered(:final why) => (false, 'unanswered $why'),
+      NotTip(:final tip) => (_Outcome.absent, 'not-tip ${tip.hex}', null),
+      WriteRefused(:final why) => (_Outcome.absent, 'refused $why', null),
+      // The writer's own words: failed partway, and may be in.
+      WriteFailed(:final why) => (_Outcome.unknown, 'failed $why', null),
+      Unanswered(:final why) => (_Outcome.unknown, 'unanswered $why', null),
     };
   }
 
@@ -212,9 +275,8 @@ final class RelayServer<V extends Object> {
         if (!done.isCompleted) done.complete(_Read(builder.takeBytes()));
       },
       onError: (Object e) {
-        if (!done.isCompleted) done.complete(const _TooSlow());
+        if (!done.isCompleted) done.complete(const _Broken());
       },
-      cancelOnError: true,
     );
     final body = await done.future;
     timer.cancel();
@@ -237,11 +299,6 @@ final class RelayServer<V extends Object> {
       req.response.headers.contentType = ContentType.json;
       req.response.write(jsonEncode(response));
     }
-    await req.response.close();
-  }
-
-  static Future<void> _end(HttpRequest req, int status) async {
-    req.response.statusCode = status;
     await req.response.close();
   }
 
@@ -309,4 +366,21 @@ final class _TooLarge extends _Body {
 
 final class _TooSlow extends _Body {
   const _TooSlow();
+}
+
+/// The body stream failed: the sender went away mid-body.
+final class _Broken extends _Body {
+  const _Broken();
+}
+
+/// What became of a write.
+enum _Outcome {
+  /// The logbook holds it.
+  recorded,
+
+  /// The logbook certainly doesn't hold it.
+  absent,
+
+  /// It may or may not be in.
+  unknown,
 }
