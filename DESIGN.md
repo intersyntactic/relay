@@ -55,14 +55,20 @@ latest, and the in-flight cap bounds all unfinished work.
 
 1. **Refuse at the door**, with a non-2xx, without reading the body: wrong
    path or method, a declared length over the cap, the in-flight cap full,
-   the source's write-rate bound exceeded, no key set yet, or a header check
-   that fails. Answer and drop the connection (`_refuseUnread` in
-   teams_module's `teams_relay.dart`; dart:io's `response.close()` would wait
-   for the whole body).
+   no key set yet, or a header check that fails. Answer and drop the
+   connection (`_refuseUnread` in teams_module's `teams_relay.dart`;
+   dart:io's `response.close()` would wait for the whole body). A body
+   refused partway (too large, too slow) is dropped the same way. Its
+   subscription is paused, not cancelled, because cancelling separates
+   dart:io's request from its response and the socket can no longer be
+   taken.
 2. **Read the body** under the cap and the budget into a buffer the relay
-   owns. The check gets an unmodifiable view of it
-   (`UnmodifiableUint8ListView`), so the bytes written are the bytes checked.
-3. **Check** it with the source's check (below).
+   owns. The check gets an unmodifiable view of it (`asUnmodifiableView()`),
+   so the bytes written are the bytes checked.
+3. **Check** it with the source's check (below). Then take room from the
+   source's **write-rate bound**, or answer 429. This comes after the check
+   so that only authentic deliveries spend the bound. At the door, an
+   unauthenticated sender could use it up and shut out the source.
 4. **Write** it through is_logbook_client's `LogbookWriter.write`, as
    `<source>-event` via `encodeRelayedEvent`.
 5. **Answer.** `Written` or `AlreadyRecorded` → 2xx, with the check's
@@ -99,7 +105,7 @@ abstract interface class ChecksDeliveries<V extends Object> {
 
   /// The rest, given what the header check vouched for. [body] can't be
   /// written to. Returns a verdict, never bytes.
-  BodyVerdict checkBody(V vouched, UnmodifiableUint8ListView body);
+  BodyVerdict checkBody(V vouched, Uint8List body);
 }
 
 sealed class BodyVerdict {}
@@ -180,6 +186,12 @@ not the only way. The deploy therefore requires that the proxy keeps no
 `Authorization` header and no request body in any log. Only root and the
 relay's user can read that hop.
 
+The proxy also bounds what the relay can't. dart:io's `HttpServer` has no
+timeout on reading request headers. A sender that trickles headers never
+reaches the relay's handler, so the in-flight cap can't count it, and enough
+such senders would exhaust the box's sockets. The proxy's header-read
+timeout and connection limits are the bound.
+
 - **Approvals through Teams rest on the token staying private** (accepted by
   Nick, 2026-11-24; owners: teams_module and agent_loop). A captured Bot
   Connector token can carry any body until it expires, including one that
@@ -192,7 +204,7 @@ relay's user can read that hop.
 - **Replays and floods each write a permanent entry** (owner: is_relay).
   With `at` in every body, each exact replay is a new entry, and a captured
   Teams token can write distinct ones. The logbook only grows. A coarse
-  per-source write-rate bound, checked at the door, caps both. Its cost is
+  per-source write-rate bound, checked after the check, caps both. Its cost is
   the cost of any flood bound: while one source is flooded, its honest
   deliveries are refused too. Slack drops them after three retries, Teams
   after its resends, and GitHub's go to the redelivery sweep. Don't "fix"
@@ -208,11 +220,16 @@ relay's user can read that hop.
 
 `RelayServer`: listens on loopback (default 127.0.0.1, port from config)
 behind the TLS proxy, one path, POST only. It takes a `ChecksDeliveries`, the
-writer (a function, `LogbookWriter(path).write` by default, so tests pass a
-fake), a clock, the budget, the body cap, the cap on requests in flight
-(each held until its budget ends), the per-source write-rate bound, the key
-source if there is one, and a log. It logs one line per request: the status and the reason, never the
-content.
+logbook's write socket (a `LogbookSocket`), a clock, the budget, the body cap,
+the cap on requests in flight (each held until its budget ends), the
+per-source write-rate bound, and a log. It logs one line per request: the
+status and the reason, never the content.
+
+The relay writes through its own `LogbookWriter`, not an injected function.
+That writer's timeout is the budget remaining, and it destroys its socket
+when the timeout runs out, so no write outlives its request. An injected
+writer can't promise that. Tests run a fake logbook on a Unix socket that
+speaks the real wire protocol.
 
 No `/ws`, no `onEvent`. Those existed for when Intersyntactic ran on Nick's
 laptop.
