@@ -199,13 +199,16 @@ configured. Caddy logs a request's headers only when a handler errors, and it
 redacts `Authorization` by default (`log_credentials` is unset). Other
 headers, `X-Slack-Signature` among them, do appear in clear, but no body
 ever does, so a captured signature can't be replayed without its body. No
-body is logged, mirrored or buffered. The header-read timeout is 1 minute,
-and a body that stalls is cut after 1 minute idle. Neither limit is in the
-Caddyfile, though: both are defaults of an unpinned `caddy:2-alpine` image,
-and there's no cap on total body-read time or size. The fix belongs in
-`enspyrco/infra`: set these timeouts and `max_header_size` explicitly, pin
-the image, and rotate the docker logs. Until that lands, this rule rests on
-an image's defaults rather than on config in the repo.
+body is logged, mirrored or buffered. Since
+https://github.com/enspyrco/infra/pull/439 these bounds are config: the
+Caddyfile's global `servers` block sets `read_header 10s` and `idle 2m`, the
+image is pinned by digest (`caddy:2.11.7-alpine`), and the docker logs
+rotate. `max_header_size` is still Caddy's default of 16 KiB.
+
+**The proxy does not bound bodies.** `read_body` is server-wide, and other
+sites on the box take large uploads, so it stays unset. A relay's own
+`budget` and `maxBodyBytes` are the only bound on a body, and a relay must
+set them.
 
 - **Approvals through Teams rest on the token staying private** (accepted by
   Nick, 2026-11-24; owners: teams_module and agent_loop). A captured Bot
