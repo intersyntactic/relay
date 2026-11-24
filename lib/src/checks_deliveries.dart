@@ -84,23 +84,35 @@ final class Refuse extends BodyVerdict {
 }
 
 /// The statuses a relay refuses with. None is a 2xx: a 2xx means recorded.
+/// The relay server answers nothing else, so a sender's retry logic can read
+/// [worthAnotherTry] instead of guessing from the number.
 enum RefusalStatus {
-  badRequest(400, 'Bad Request'),
-  unauthorized(401, 'Unauthorized'),
-  forbidden(403, 'Forbidden'),
-  notFound(404, 'Not Found'),
-  methodNotAllowed(405, 'Method Not Allowed'),
-  requestTimeout(408, 'Request Timeout'),
-  payloadTooLarge(413, 'Payload Too Large'),
-  tooManyRequests(429, 'Too Many Requests'),
-  internalServerError(500, 'Internal Server Error'),
-  serviceUnavailable(503, 'Service Unavailable');
+  badRequest(400, 'Bad Request', worthAnotherTry: false),
+  unauthorized(401, 'Unauthorized', worthAnotherTry: false),
+  forbidden(403, 'Forbidden', worthAnotherTry: false),
+  notFound(404, 'Not Found', worthAnotherTry: false),
+  methodNotAllowed(405, 'Method Not Allowed', worthAnotherTry: false),
+  requestTimeout(408, 'Request Timeout', worthAnotherTry: true),
+  payloadTooLarge(413, 'Payload Too Large', worthAnotherTry: false),
+  tooManyRequests(429, 'Too Many Requests', worthAnotherTry: true),
+  internalServerError(500, 'Internal Server Error', worthAnotherTry: true),
+  serviceUnavailable(503, 'Service Unavailable', worthAnotherTry: true);
 
-  const RefusalStatus(this.code, this.phrase);
+  const RefusalStatus(this.code, this.phrase, {required this.worthAnotherTry});
 
   /// The HTTP status code.
   final int code;
 
   /// The reason phrase for the status line.
   final String phrase;
+
+  /// Whether sending the same bytes again may be recorded: the refusal came
+  /// from the relay's state (busy, rate bound, a slow body, the logbook, a
+  /// check that threw), not from what the delivery is.
+  final bool worthAnotherTry;
+
+  /// The refusal whose [code] is [code], or null for a status no relay
+  /// refuses with.
+  static RefusalStatus? ofCode(int code) =>
+      values.where((s) => s.code == code).firstOrNull;
 }

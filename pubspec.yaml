@@ -2,7 +2,7 @@ name: is_relay
 description: >-
   What every Intersyntactic relay shares: take a delivery from an outside
   source, check it, record it in the logbook, and only then answer.
-version: 0.1.0
+version: 0.2.0
 repository: https://github.com/intersyntactic/relay
 
 environment:

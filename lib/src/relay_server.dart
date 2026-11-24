@@ -58,6 +58,11 @@ final class RelayPath {
 ///
 /// It keeps no record of what it has seen. A duplicate is written like any
 /// delivery; the docking station decides each `EventKey` once.
+///
+/// It answers 200 once a delivery is recorded and a [RefusalStatus]
+/// otherwise, never another status: a sender reads
+/// `RefusalStatus.ofCode(status)?.worthAnotherTry` to decide whether to send
+/// the same bytes again.
 final class RelayServer<V extends Object> {
   RelayServer({
     required this.check,
@@ -202,12 +207,17 @@ final class RelayServer<V extends Object> {
     try {
       verdict = check.checkBody(vouched, bytes.asUnmodifiableView());
     } on Exception catch (e) {
-      return _answer(req, 500, 'body check threw ${e.runtimeType}', left);
+      return _refuse(
+        req,
+        RefusalStatus.internalServerError,
+        'body check threw ${e.runtimeType}',
+        left,
+      );
     }
     final Record record;
     switch (verdict) {
       case Refuse(:final status, :final reason):
-        return _answer(req, status.code, reason, left);
+        return _refuse(req, status, reason, left);
       case final Record r:
         record = r;
     }
@@ -215,27 +225,22 @@ final class RelayServer<V extends Object> {
     // After the check, so only authentic deliveries spend the bound: an
     // unauthenticated sender can't use it up and shut out the source.
     if (!rate.take()) {
-      return _answer(
-        req,
-        RefusalStatus.tooManyRequests.code,
-        'rate bound',
-        left,
-      );
+      return _refuse(req, RefusalStatus.tooManyRequests, 'rate bound', left);
     }
 
     final (outcome, why) = await _write(bytes, clock);
     switch (outcome) {
       case _Outcome.recorded:
-        return _answer(req, 200, why, left, record.response);
+        return _send(req, 200, why, left, record.response);
       case _Outcome.absent:
         // Certainly not in the logbook: give the room back, or an outage
         // would leave the bound spent on the retries.
         rate.giveBack();
-        return _answer(req, 503, why, left);
+        return _refuse(req, RefusalStatus.serviceUnavailable, why, left);
       case _Outcome.unknown:
         // It may be in, so the room stays spent: the bound counts what
         // could be recorded, not what was confirmed.
-        return _answer(req, 503, why, left);
+        return _refuse(req, RefusalStatus.serviceUnavailable, why, left);
     }
   }
 
@@ -318,7 +323,16 @@ final class RelayServer<V extends Object> {
   /// what remains of the budget: a sender that stops reading can't hold the
   /// request past it. (Not set earlier: a deadline that fired during the
   /// body read would destroy the socket under it.)
-  Future<void> _answer(
+  Future<void> _refuse(
+    HttpRequest req,
+    RefusalStatus status,
+    String reason,
+    Duration Function() left,
+  ) => _send(req, status.code, reason, left);
+
+  /// [_refuse] and the recorded answer's shared body. Only those two call
+  /// it, so every status a relay answers is 200 or a [RefusalStatus].
+  Future<void> _send(
     HttpRequest req,
     int status,
     String reason,
