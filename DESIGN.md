@@ -192,8 +192,8 @@ reaches the relay's handler, so the in-flight cap can't count it, and enough
 such senders would exhaust the box's sockets. The proxy's header-read
 timeout and connection limits are the bound.
 
-**What the proxy actually does** (Caddy v2.11.7, audited by infra-dc on
-2026-11-24 against `enspyrco/infra` `caddy/Caddyfile` and 14 days of logs).
+**What the proxy actually does** (Caddy v2.11.7, audited on 2026-11-24
+against `enspyrco/infra` `caddy/Caddyfile` and 14 days of logs).
 The relay vhosts are bare `reverse_proxy` blocks, and no access log is
 configured. Caddy logs a request's headers only when a handler errors, and it
 redacts `Authorization` by default (`log_credentials` is unset). Other
@@ -202,9 +202,9 @@ ever does, so a captured signature can't be replayed without its body. No
 body is logged, mirrored or buffered. The header-read timeout is 1 minute,
 and a body that stalls is cut after 1 minute idle. Neither limit is in the
 Caddyfile, though: both are defaults of an unpinned `caddy:2-alpine` image,
-and there's no cap on total body-read time or size. infra-dc has proposed to
-Nick setting these timeouts and `max_header_size` explicitly, pinning the
-image, and rotating the docker logs. Until that lands, this rule rests on
+and there's no cap on total body-read time or size. The fix belongs in
+`enspyrco/infra`: set these timeouts and `max_header_size` explicitly, pin
+the image, and rotate the docker logs. Until that lands, this rule rests on
 an image's defaults rather than on config in the repo.
 
 - **Approvals through Teams rest on the token staying private** (accepted by
