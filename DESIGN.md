@@ -121,8 +121,7 @@ The check returns a verdict. It doesn't return bytes. On `Record`, the
 relay writes **the buffer it read**, which the check saw only through a view
 it couldn't write to. The relay is the only thing that holds a writer and
 the buffer. No source package can substitute or alter the bytes. That isn't
-a proof the check did its cryptography right. That's what review and the
-audit are for.
+a proof the check did its cryptography right. That's what review is for.
 
 The relay has no wake filter, so outside the check nothing reads
 uncovered data. For GitHub that matters: `X-GitHub-Event` is a header
@@ -152,8 +151,8 @@ translator contract:
   value. The docking station's own decisions never read `from`. Downstream
   readers do, in two places: `ShownMessageJudged.from` (who approved, turned
   into NodeApproval/NodeCorrection in agent_loop) and the withdrawal rule
-  for `MessageChanged`. That approval path is the Fable audit's first
-  target.
+  for `MessageChanged`. That approval path is the accepted risk under
+  "Named tradeoffs".
 - GitHub's event kind is **not recorded**. The translator classifies from
   the signed body alone, and a body that isn't unambiguously one shape it
   knows is `NothingToAdmit`. `issues` and `issue_comment` both carry
@@ -218,7 +217,7 @@ set them.
   drives withdrawal, so with a captured token both can name anyone. Accepted
   because a capture needs the box (above) and the token expires. The
   alternative, stopping a sender-only source from emitting them, would end
-  approvals from Teams. This is the Fable audit's first target.
+  approvals from Teams.
 - **Replays and floods each write a permanent entry** (owner: is_relay).
   With `at` in every body, each exact replay is a new entry, and a captured
   Teams token can write distinct ones. The logbook only grows. A coarse
@@ -271,8 +270,7 @@ refuses everything, as all three gates do today.
 
 ## Review
 
-`/cage-match` on every PR. A scheduled Fable security audit of is_relay and
-each relay that uses it, plus one on every release.
+`/cage-match` on every PR.
 
 ## Open questions
 
