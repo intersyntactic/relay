@@ -1,3 +1,7 @@
+## 0.3.0
+
+- Requires is_docking_station_api ^0.7.0 (was ^0.4.0), so a relay can share a dependency graph with modules that use 0.7.0's reply endpoints. Nothing is_relay uses changed: `RelayedEventSource` and `encodeRelayedEvent` are the same, and the logbook entry it writes is byte-for-byte the same. A minor bump because `ChecksDeliveries.source` exposes `RelayedEventSource`, so a relay moving to this version moves its own is_docking_station_api too.
+
 ## 0.2.0
 
 - `RefusalStatus.worthAnotherTry` says whether sending the same bytes again may be recorded (408, 429, 500 and 503 yes; the rest no), and `RefusalStatus.ofCode` reads a status back. `RelayServer` now answers only 200 or a `RefusalStatus`, so a redelivery sweep can read these instead of guessing from the number.
