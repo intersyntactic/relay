@@ -31,15 +31,18 @@ final class _TestCheck implements ChecksDeliveries<String> {
   @override
   BodyVerdict checkBody(String vouched, Uint8List body) {
     seenBodies.add(body);
-    return utf8.decode(body) == 'refuse'
-        ? const Refuse(RefusalStatus.forbidden, 'refused body')
-        : Record(response: JsonObject.of({'ok': vouched}));
+    return switch (utf8.decode(body)) {
+      'refuse' => const Refuse(RefusalStatus.forbidden, 'refused body'),
+      'bad response' => Record(response: JsonObject.of({'at': DateTime(2026)})),
+      _ => Record(response: JsonObject.of({'ok': vouched})),
+    };
   }
 }
 
 /// A source that projects: the same header check as [_TestCheck], and a body
 /// check that keeps only a JSON body's `text`, so its `token` is never
-/// recorded. A body of `refuse` is refused and `throw` makes it throw.
+/// recorded. A body of `refuse` is refused, `throw` makes it throw, and
+/// `unencodable` and `deep` return projections JSON can't carry.
 final class _ProjectingCheck implements ChecksAndProjectsDeliveries<String> {
   final seenBodies = <Uint8List>[];
 
@@ -60,6 +63,16 @@ final class _ProjectingCheck implements ChecksAndProjectsDeliveries<String> {
       return const Refuse(RefusalStatus.forbidden, 'refused body');
     }
     if (text == 'throw') throw const FormatException('unreadable');
+    if (text == 'unencodable') {
+      return RecordProjection(JsonObject.of({'at': DateTime(2026)}));
+    }
+    if (text == 'deep') {
+      Object? nested = 'bottom';
+      for (var i = 0; i < 100; i++) {
+        nested = {'down': nested};
+      }
+      return RecordProjection(JsonObject.of({'nested': nested}));
+    }
     final activity = JsonObject.parse(jsonDecode(text))!;
     return RecordProjection(
       JsonObject.of({'projection': 1, 'text': activity.string('text')}),
@@ -286,6 +299,13 @@ void main() {
       expect((await post('again')).$1, 200);
     });
 
+    test('a response JSON cannot carry is a 500 before anything is written, '
+        'and the relay keeps serving', () async {
+      expect((await post('bad response')).$1, 500);
+      expect(logbook.requests, isEmpty);
+      expect((await post('after')).$1, 200);
+    });
+
     for (final answer in [
       _Answer.failed,
       _Answer.refusedKind,
@@ -457,9 +477,13 @@ void main() {
       expect(clock.elapsed, lessThan(const Duration(seconds: 2)));
     });
 
-    test('a body trickled past the budget is refused', () async {
+    test('a body trickled past the budget is refused inside it', () async {
       await start(budget: const Duration(milliseconds: 300));
+      final clock = Stopwatch()..start();
       expect(await rawStatus(body: 'ab', declaredLength: 10), 408);
+      // The read keeps back the answer's time, so the refusal lands before
+      // the budget ends, not after it.
+      expect(clock.elapsed, lessThan(const Duration(milliseconds: 300)));
       expect(logbook.requests, isEmpty);
     });
 
@@ -496,13 +520,21 @@ void main() {
       final request = logbook.requests.single;
       final (kind, entry) = _FakeLogbook.parse(request);
       final event = RelayedEvent.read(ObjectId.of(Uint8List(1)), kind, entry);
-      // The entry holds the recorded bytes base64-encoded, so look in both
-      // the decoded bytes and the request as sent.
+      // The entry holds the recorded bytes base64-encoded, so a search of the
+      // request as sent can't see them: decode first.
       expect(utf8.decode(event!.bytes), isNot(contains('SECRET')));
-      expect(
-        utf8.decode(request, allowMalformed: true),
-        isNot(contains('SECRET')),
-      );
+    });
+
+    test('a projection JSON cannot carry is a 500, nothing written, '
+        'and the relay keeps serving', () async {
+      expect((await post('unencodable')).$1, 500);
+      expect(logbook.requests, isEmpty);
+      expect((await post(withToken)).$1, 200);
+    });
+
+    test('a projection nested too deep is a 500, nothing written', () async {
+      expect((await post('deep')).$1, 500);
+      expect(logbook.requests, isEmpty);
     });
 
     test('the same delivery projects to the same bytes', () async {

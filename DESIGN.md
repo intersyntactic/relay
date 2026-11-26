@@ -149,10 +149,26 @@ in. Its verdict has no `Record`, so a projecting source can't fall back to
 recording the raw body on any path. The cost: for these sources, the
 entry's bytes are what the source's code kept from an authentic delivery,
 not what arrived. Teams' token doesn't bind the body anyway (see below), so
-the bytes never carried that proof. The entry's shape (`{"at","bytes"}`) is
-the same for both kinds, so nothing downstream reads them differently. A
-projection should be deterministic and carry a version, so the same activity
-records the same bytes.
+the bytes never carried that proof. The type stops a projecting source
+falling back to the raw body; it doesn't stop one copying a credential into
+its projection on purpose. Which fields it names is that source's code and
+review.
+
+The entry's shape (`{"at","bytes"}`) is the same for both kinds, so the
+docking station reads them the same way. Only the source's translator reads
+what is in `bytes`, and for a source that starts projecting, it must read
+both the raw entries already in the logbook and the projections after them.
+A projection must:
+
+- **keep what tells two deliveries apart**: the identity the translator
+  builds its `EventKey` from (for Teams, the activity id). Two different
+  deliveries that projected to the same identity would be decided as one,
+  silently, because the relay has already answered 200;
+- **carry a version**, so a translator knows which shape it is reading;
+- **be deterministic**, so the same delivery records the same bytes.
+
+The relay refuses with 500, before anything is written, a projection or
+response JSON can't carry, or one nested more than 64 deep.
 
 The relay has no wake filter, so outside the check nothing reads
 uncovered data. For GitHub that matters: `X-GitHub-Event` is a header
