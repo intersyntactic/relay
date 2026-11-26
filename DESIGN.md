@@ -168,7 +168,15 @@ A projection must:
 - **be deterministic**, so the same delivery records the same bytes.
 
 The relay refuses with 500, before anything is written, a projection or
-response JSON can't carry, or one nested more than 64 deep.
+response JSON can't carry, one nested more than 64 deep, or one holding more
+than 2^20 values. Those limits catch a check's honest mistakes (a `DateTime`
+in a projection, runaway nesting). They don't defend the relay against a
+check written to exhaust it, for example one sharing a huge string across
+many places: a check is trusted code from the source's own package, as it
+already is when it returns `Record`, and a check that misbehaves on purpose
+is a bug in that package, like one that throws an `Error`. Input from a
+sender can't build such a value: `jsonDecode` makes finite trees no larger
+than the body. Making a non-JSON value unbuildable belongs in checked_json.
 
 The relay has no wake filter, so outside the check nothing reads
 uncovered data. For GitHub that matters: `X-GitHub-Event` is a header
