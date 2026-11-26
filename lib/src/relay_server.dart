@@ -145,26 +145,33 @@ final class RelayServer<V extends Object> {
   /// How deep a check's JSON may nest. Deeper is refused, not encoded.
   static const _maxJsonDepth = 64;
 
-  /// [o] as the bytes the relay records or sends, or null when it holds a
-  /// value JSON can't carry. `JsonObject.of` doesn't check its values, and
-  /// `jsonEncode` throws an `Error` on one, which would end the process; so
-  /// nothing reaches it unchecked.
-  static Uint8List? _encode(JsonObject o) =>
-      _isJson(o, 0) ? utf8.encode(jsonEncode(o)) : null;
+  /// How many values a check's JSON may hold in all, counting a value
+  /// shared between places once per place, as `jsonEncode` would write it.
+  static const _maxJsonValues = 1 << 20;
 
-  static bool _isJson(Object? v, int depth) =>
-      depth <= _maxJsonDepth &&
-      switch (v) {
-        null || bool() || String() || int() => true,
-        final double d => d.isFinite,
-        final List<Object?> l => l.every((e) => _isJson(e, depth + 1)),
-        _ => switch (JsonObject.parse(v)) {
-          final JsonObject o => o.keys.every(
-            (k) => _isJson(o.raw(k), depth + 1),
-          ),
-          null => false,
-        },
-      };
+  /// [o] as the bytes the relay records or sends, or null when it holds a
+  /// value JSON can't carry, nests too deep or holds too many values.
+  /// `JsonObject.of` doesn't check its values, and `jsonEncode` throws an
+  /// `Error` on one, which would end the process; so nothing reaches it
+  /// unchecked.
+  static Uint8List? _encode(JsonObject o) {
+    var left = _maxJsonValues;
+    bool isJson(Object? v, int depth) =>
+        depth <= _maxJsonDepth &&
+        --left >= 0 &&
+        switch (v) {
+          null || bool() || String() || int() => true,
+          final double d => d.isFinite,
+          final List<Object?> l => l.every((e) => isJson(e, depth + 1)),
+          _ => switch (JsonObject.parse(v)) {
+            final JsonObject o => o.keys.every(
+              (k) => isJson(o.raw(k), depth + 1),
+            ),
+            null => false,
+          },
+        };
+    return isJson(o, 0) ? utf8.encode(jsonEncode(o)) : null;
+  }
 
   /// What to record and send, both encoded before the write, or
   /// [_Unencodable] when either can't be.

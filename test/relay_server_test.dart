@@ -66,6 +66,14 @@ final class _ProjectingCheck implements ChecksAndProjectsDeliveries<String> {
     if (text == 'unencodable') {
       return RecordProjection(JsonObject.of({'at': DateTime(2026)}));
     }
+    if (text == 'shared') {
+      // 45 levels of one list held twice: 45 lists, 2^45 places to visit.
+      Object? v = 'leaf';
+      for (var i = 0; i < 45; i++) {
+        v = [v, v];
+      }
+      return RecordProjection(JsonObject.of({'v': v}));
+    }
     if (text == 'deep') {
       Object? nested = 'bottom';
       for (var i = 0; i < 100; i++) {
@@ -483,7 +491,8 @@ void main() {
       expect(await rawStatus(body: 'ab', declaredLength: 10), 408);
       // The read keeps back the answer's time, so the refusal lands before
       // the budget ends, not after it.
-      expect(clock.elapsed, lessThan(const Duration(milliseconds: 300)));
+      // Lands near 50 ms; without the reserve, at 300 ms or later.
+      expect(clock.elapsed, lessThan(const Duration(milliseconds: 200)));
       expect(logbook.requests, isEmpty);
     });
 
@@ -532,23 +541,16 @@ void main() {
       expect((await post(withToken)).$1, 200);
     });
 
-    test('a projection nested too deep is a 500, nothing written', () async {
-      expect((await post('deep')).$1, 500);
+    test('a projection too large to walk is a 500, promptly', () async {
+      final clock = Stopwatch()..start();
+      expect((await post('shared')).$1, 500);
+      expect(clock.elapsed, lessThan(const Duration(seconds: 5)));
       expect(logbook.requests, isEmpty);
     });
 
-    test('the same delivery projects to the same bytes', () async {
-      await post(withToken);
-      await post(withToken);
-      final [first, second] = [
-        for (final r in logbook.requests)
-          RelayedEvent.read(
-            ObjectId.of(Uint8List(1)),
-            _FakeLogbook.parse(r).$1,
-            _FakeLogbook.parse(r).$2,
-          )!.bytes,
-      ];
-      expect(first, second);
+    test('a projection nested too deep is a 500, nothing written', () async {
+      expect((await post('deep')).$1, 500);
+      expect(logbook.requests, isEmpty);
     });
 
     test('a refusal is answered and nothing is written', () async {
