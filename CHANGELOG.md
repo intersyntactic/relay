@@ -1,3 +1,9 @@
+## 0.5.0
+
+- `ChecksAndProjectsDeliveries` and `RelayServer.projecting`, for a source whose deliveries mustn't be recorded as they arrived because they can carry credentials in fields no list could name (a Teams activity's open `value`). Its `checkBody` returns a `ProjectedVerdict`: `RecordProjection(projection, response:)` or `Refuse`. It has no `Record`, so a projecting source can't fall back to recording the raw body. The relay encodes the projection as JSON, and the logbook entry keeps its shape.
+- `ChecksDeliveryHeaders`, the header half both kinds of check share. `ChecksDeliveries` now implements it; its members are unchanged.
+- Breaking: `RelayServer.check` is now typed `ChecksDeliveryHeaders<V>`, and `Record` and `Refuse` implement their sealed verdict types instead of extending `BodyVerdict`. A relay that only implements `ChecksDeliveries` and constructs `RelayServer(check: ...)` needs no change.
+
 ## 0.4.0
 
 - Requires is_docking_station_api ^0.8.0 (was ^0.7.0). 0.8.0 depends on is_conversation_reply_vocabulary, the renamed is_reply_vocabulary, so a tree that holds is_relay can now move to the new name. Nothing is_relay uses changed, and the logbook entry is the same. A minor bump for the same reason as 0.3.0: `ChecksDeliveries.source` exposes `RelayedEventSource`.

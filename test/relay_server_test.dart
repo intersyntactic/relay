@@ -37,6 +37,37 @@ final class _TestCheck implements ChecksDeliveries<String> {
   }
 }
 
+/// A source that projects: the same header check as [_TestCheck], and a body
+/// check that keeps only a JSON body's `text`, so its `token` is never
+/// recorded. A body of `refuse` is refused and `throw` makes it throw.
+final class _ProjectingCheck implements ChecksAndProjectsDeliveries<String> {
+  final seenBodies = <Uint8List>[];
+
+  @override
+  RelayedEventSource get source => RelayedEventSource.parse('test')!;
+
+  @override
+  HeaderCheck<String> checkHeaders(DeliveryHeaders headers, DateTime now) =>
+      headers['X-Test-Key'] == 'good'
+      ? const HeadersVouch('good')
+      : const HeadersRefused(RefusalStatus.unauthorized, 'bad key');
+
+  @override
+  ProjectedVerdict checkBody(String vouched, Uint8List body) {
+    seenBodies.add(body);
+    final text = utf8.decode(body);
+    if (text == 'refuse') {
+      return const Refuse(RefusalStatus.forbidden, 'refused body');
+    }
+    if (text == 'throw') throw const FormatException('unreadable');
+    final activity = JsonObject.parse(jsonDecode(text))!;
+    return RecordProjection(
+      JsonObject.of({'projection': 1, 'text': activity.string('text')}),
+      response: JsonObject.of({'ok': vouched}),
+    );
+  }
+}
+
 /// How the fake logbook answers a write.
 enum _Answer { ok, duplicate, refusedKind, failed, notTip, silent }
 
@@ -130,6 +161,7 @@ final class _FakeLogbook {
 void main() {
   late HttpServer server;
   late _TestCheck check;
+  late _ProjectingCheck projector;
   late _FakeLogbook logbook;
   late List<String> logged;
   late Uri url;
@@ -140,24 +172,40 @@ void main() {
     int burst = 100,
     int maxBodyBytes = 1024,
     int maxInFlight = 8,
+    bool projecting = false,
   }) async {
     started = true;
     check = _TestCheck();
+    projector = _ProjectingCheck();
     logbook = await _FakeLogbook.start();
     logged = [];
     server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     url = Uri.parse('http://127.0.0.1:${server.port}/in');
+    final relayPath = RelayPath.parse('/in')!;
+    final rate = WriteRateBound(perMinute: 1, burst: burst);
     unawaited(
-      RelayServer(
-        check: check,
-        logbook: logbook.socket,
-        path: RelayPath.parse('/in')!,
-        budget: budget,
-        rate: WriteRateBound(perMinute: 1, burst: burst),
-        maxBodyBytes: maxBodyBytes,
-        maxInFlight: maxInFlight,
-        log: logged.add,
-      ).serve(server),
+      (projecting
+              ? RelayServer.projecting(
+                  check: projector,
+                  logbook: logbook.socket,
+                  path: relayPath,
+                  budget: budget,
+                  rate: rate,
+                  maxBodyBytes: maxBodyBytes,
+                  maxInFlight: maxInFlight,
+                  log: logged.add,
+                )
+              : RelayServer(
+                  check: check,
+                  logbook: logbook.socket,
+                  path: relayPath,
+                  budget: budget,
+                  rate: rate,
+                  maxBodyBytes: maxBodyBytes,
+                  maxInFlight: maxInFlight,
+                  log: logged.add,
+                ))
+          .serve(server),
     );
   }
 
@@ -422,6 +470,73 @@ void main() {
       // The silent write ended with the budget, so the place is free.
       logbook.answer = _Answer.ok;
       expect((await post('after')).$1, 200);
+    });
+  });
+
+  group('a projecting relay', () {
+    setUp(() => start(projecting: true));
+
+    const withToken = '{"text":"hi","token":"SECRET-AAD-JWT"}';
+
+    test('records the projection, not the body, then 200', () async {
+      final (status, body) = await post(withToken);
+      expect(status, 200);
+      expect(jsonDecode(body), {'ok': 'good'});
+      final (kind, entry) = _FakeLogbook.parse(logbook.requests.single);
+      expect(kind.name, 'test-event');
+      final event = RelayedEvent.read(ObjectId.of(Uint8List(1)), kind, entry);
+      expect(jsonDecode(utf8.decode(event!.bytes)), {
+        'projection': 1,
+        'text': 'hi',
+      });
+    });
+
+    test('a field the projection leaves out is not recorded', () async {
+      await post(withToken);
+      final request = logbook.requests.single;
+      final (kind, entry) = _FakeLogbook.parse(request);
+      final event = RelayedEvent.read(ObjectId.of(Uint8List(1)), kind, entry);
+      // The entry holds the recorded bytes base64-encoded, so look in both
+      // the decoded bytes and the request as sent.
+      expect(utf8.decode(event!.bytes), isNot(contains('SECRET')));
+      expect(
+        utf8.decode(request, allowMalformed: true),
+        isNot(contains('SECRET')),
+      );
+    });
+
+    test('the same delivery projects to the same bytes', () async {
+      await post(withToken);
+      await post(withToken);
+      final [first, second] = [
+        for (final r in logbook.requests)
+          RelayedEvent.read(
+            ObjectId.of(Uint8List(1)),
+            _FakeLogbook.parse(r).$1,
+            _FakeLogbook.parse(r).$2,
+          )!.bytes,
+      ];
+      expect(first, second);
+    });
+
+    test('a refusal is answered and nothing is written', () async {
+      expect((await post('refuse')).$1, 403);
+      expect(logbook.requests, isEmpty);
+    });
+
+    test('a check that throws is a 500, nothing written', () async {
+      expect((await post('throw')).$1, 500);
+      expect(logbook.requests, isEmpty);
+    });
+
+    test('the check sees a body it cannot write to', () async {
+      await post(withToken);
+      expect(() => projector.seenBodies.single[0] = 0, throwsUnsupportedError);
+    });
+
+    test('no 2xx without the write: a failed write is a 503', () async {
+      logbook.answer = _Answer.failed;
+      expect(await post(withToken), (503, ''));
     });
   });
 

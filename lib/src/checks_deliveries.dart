@@ -7,23 +7,45 @@ import 'package:checked_json/checked_json.dart';
 import 'package:is_docking_station_api/is_docking_station_api.dart'
     show RelayedEventSource;
 
-/// A source's check of its deliveries, in two parts: what the headers alone
+/// The half of a source's check both kinds share: what the headers alone
 /// decide, so a sender with no valid credentials is refused before a byte
-/// of its body is read, and the rest once the body is in hand.
+/// of its body is read.
 ///
 /// [V] is what the header check vouched for (a verified token, a signature
-/// still to compare), handed to [checkBody]. A relay never looks inside it.
-abstract interface class ChecksDeliveries<V extends Object> {
+/// still to compare), handed to the body check. A relay never looks inside
+/// it.
+abstract interface class ChecksDeliveryHeaders<V extends Object> {
   /// The source, which names the kind its deliveries are recorded as.
   RelayedEventSource get source;
 
   /// What [headers] alone decide, at [now].
   HeaderCheck<V> checkHeaders(DeliveryHeaders headers, DateTime now);
+}
 
+/// A source's check of its deliveries, for a source whose deliveries are
+/// recorded exactly as they arrived: its headers, then its body once in
+/// hand.
+abstract interface class ChecksDeliveries<V extends Object>
+    implements ChecksDeliveryHeaders<V> {
   /// The rest, given what [checkHeaders] vouched for. [body] can't be
   /// written to, so the bytes recorded are the bytes checked. Returns a
   /// verdict, never bytes: on [Record], the relay records its own copy.
   BodyVerdict checkBody(V vouched, Uint8List body);
+}
+
+/// A source's check of its deliveries, for a source whose deliveries must
+/// not be recorded as they arrived (a Teams activity can carry a person's
+/// token in fields no list could name), so only a projection of each one
+/// is: the fields its translator reads, built fresh.
+///
+/// Its verdict has no way to record the raw body, so a source that projects
+/// can't fall back to recording what arrived.
+abstract interface class ChecksAndProjectsDeliveries<V extends Object>
+    implements ChecksDeliveryHeaders<V> {
+  /// The rest, given what [checkHeaders] vouched for. [body] can't be
+  /// written to. On [RecordProjection], the relay records the projection,
+  /// encoded as JSON, in place of the body.
+  ProjectedVerdict checkBody(V vouched, Uint8List body);
 }
 
 /// A delivery's headers, read by name in any case.
@@ -61,21 +83,36 @@ final class HeadersRefused<V extends Object> extends HeaderCheck<V> {
   final String reason;
 }
 
-/// What a delivery's body decided.
-sealed class BodyVerdict {
-  const BodyVerdict();
-}
+/// What a delivery's body decided, for a [ChecksDeliveries].
+sealed class BodyVerdict {}
+
+/// What a delivery's body decided, for a [ChecksAndProjectsDeliveries]:
+/// there is no [Record] here, so nothing records the raw body.
+sealed class ProjectedVerdict {}
 
 /// Authentic: record it, then answer 2xx with [response] as the body when
-/// there is one (a Teams invoke response, Slack's url_verification
-/// challenge). [response] goes out only once the delivery is recorded.
-final class Record extends BodyVerdict {
+/// there is one (Slack's url_verification challenge). [response] goes out
+/// only once the delivery is recorded.
+final class Record implements BodyVerdict {
   const Record({this.response});
   final JsonObject? response;
 }
 
-/// Refused on its body: answered [status], not recorded.
-final class Refuse extends BodyVerdict {
+/// Authentic: record [projection] in place of the body, then answer 2xx
+/// with [response] as the body when there is one (a Teams invoke response).
+/// [response] goes out only once the projection is recorded.
+///
+/// The relay encodes [projection] as JSON, and those bytes are what the
+/// logbook entry holds where a raw source's entry holds the body.
+final class RecordProjection implements ProjectedVerdict {
+  const RecordProjection(this.projection, {this.response});
+  final JsonObject projection;
+  final JsonObject? response;
+}
+
+/// Refused on its body: answered [status], not recorded. Both kinds of
+/// check refuse the same way.
+final class Refuse implements BodyVerdict, ProjectedVerdict {
   const Refuse(this.status, this.reason);
   final RefusalStatus status;
 

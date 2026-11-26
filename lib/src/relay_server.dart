@@ -64,8 +64,9 @@ final class RelayPath {
 /// `RefusalStatus.ofCode(status)?.worthAnotherTry` to decide whether to send
 /// the same bytes again.
 final class RelayServer<V extends Object> {
+  /// A relay that records each authentic delivery exactly as it arrived.
   RelayServer({
-    required this.check,
+    required ChecksDeliveries<V> check,
     required this.logbook,
     required this.path,
     required this.budget,
@@ -74,9 +75,43 @@ final class RelayServer<V extends Object> {
     this.maxInFlight = 64,
     this._now = DateTime.now,
     this.log = _stderr,
-  });
+  }) : check = check,
+       _decide = ((vouched, body) =>
+           switch (check.checkBody(vouched, body.asUnmodifiableView())) {
+             Record(:final response) => _Recording(body, response),
+             final Refuse refusal => _Refusing(refusal),
+           });
 
-  final ChecksDeliveries<V> check;
+  /// A relay that records a projection of each authentic delivery in place
+  /// of what arrived, so a field the projection doesn't name is never
+  /// recorded.
+  RelayServer.projecting({
+    required ChecksAndProjectsDeliveries<V> check,
+    required this.logbook,
+    required this.path,
+    required this.budget,
+    required this.rate,
+    this.maxBodyBytes = 1024 * 1024,
+    this.maxInFlight = 64,
+    this._now = DateTime.now,
+    this.log = _stderr,
+  }) : check = check,
+       _decide = ((vouched, body) =>
+           switch (check.checkBody(vouched, body.asUnmodifiableView())) {
+             RecordProjection(:final projection, :final response) => _Recording(
+               utf8.encode(jsonEncode(projection)),
+               response,
+             ),
+             final Refuse refusal => _Refusing(refusal),
+           });
+
+  /// The source's check. Its body half is held in [_decide], which is the
+  /// only thing that chooses the bytes recorded.
+  final ChecksDeliveryHeaders<V> check;
+
+  /// The body check, given the relay's own buffer: what to record, or the
+  /// refusal. A check sees only an unmodifiable view of the buffer.
+  final _Decided Function(V vouched, Uint8List body) _decide;
 
   /// The logbook service's write socket. The relay writes through its own
   /// `LogbookWriter`, whose timeout ends every write inside the budget.
@@ -203,9 +238,9 @@ final class RelayServer<V extends Object> {
     }
 
     // From here the body is read, so `close()` has nothing left to wait on.
-    final BodyVerdict verdict;
+    final _Decided decided;
     try {
-      verdict = check.checkBody(vouched, bytes.asUnmodifiableView());
+      decided = _decide(vouched, bytes);
     } on Exception catch (e) {
       return _refuse(
         req,
@@ -214,12 +249,12 @@ final class RelayServer<V extends Object> {
         left,
       );
     }
-    final Record record;
-    switch (verdict) {
-      case Refuse(:final status, :final reason):
+    final _Recording recording;
+    switch (decided) {
+      case _Refusing(refusal: Refuse(:final status, :final reason)):
         return _refuse(req, status, reason, left);
-      case final Record r:
-        record = r;
+      case final _Recording r:
+        recording = r;
     }
 
     // After the check, so only authentic deliveries spend the bound: an
@@ -228,10 +263,10 @@ final class RelayServer<V extends Object> {
       return _refuse(req, RefusalStatus.tooManyRequests, 'rate bound', left);
     }
 
-    final (outcome, why) = await _write(bytes, clock);
+    final (outcome, why) = await _write(recording.bytes, clock);
     switch (outcome) {
       case _Outcome.recorded:
-        return _send(req, 200, why, left, record.response);
+        return _send(req, 200, why, left, recording.response);
       case _Outcome.absent:
         // Certainly not in the logbook: give the room back, or an outage
         // would leave the bound spent on the retries.
@@ -413,6 +448,23 @@ final class _TooSlow extends _Body {
 /// The body stream failed: the sender went away mid-body.
 final class _Broken extends _Body {
   const _Broken();
+}
+
+/// What a body check decided, whichever kind of check it was.
+sealed class _Decided {
+  const _Decided();
+}
+
+/// Record [bytes], then answer 2xx with [response].
+final class _Recording extends _Decided {
+  const _Recording(this.bytes, this.response);
+  final Uint8List bytes;
+  final JsonObject? response;
+}
+
+final class _Refusing extends _Decided {
+  const _Refusing(this.refusal);
+  final Refuse refusal;
 }
 
 /// What became of a write.
