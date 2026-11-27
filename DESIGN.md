@@ -99,29 +99,84 @@ is_relay owns every step and the order. The source supplies only the check.
 ## The delivery check
 
 ```dart
-abstract interface class ChecksDeliveries<V extends Object> {
+abstract interface class ChecksDeliveryHeaders<V extends Object> {
   /// What the headers alone decide, before the body is read.
-  HeaderCheck<V> checkHeaders(Headers headers, DateTime now);
+  HeaderCheck<V> checkHeaders(DeliveryHeaders headers, DateTime now);
+}
 
-  /// The rest, given what the header check vouched for. [body] can't be
-  /// written to. Returns a verdict, never bytes.
+/// Records each delivery exactly as it arrived (GitHub, Slack).
+abstract interface class ChecksDeliveries<V> implements ChecksDeliveryHeaders<V> {
   BodyVerdict checkBody(V vouched, Uint8List body);
 }
 
+/// Records a projection of each delivery in place of what arrived (Teams).
+abstract interface class ChecksAndProjectsDeliveries<V> implements ChecksDeliveryHeaders<V> {
+  ProjectedVerdict checkBody(V vouched, Uint8List body);
+}
+
 sealed class BodyVerdict {}
-final class Record extends BodyVerdict { final JsonObject? response; }
-final class Refuse extends BodyVerdict { final int status; final String reason; }  // status is never 2xx
+sealed class ProjectedVerdict {}
+final class Record implements BodyVerdict { final JsonObject? response; }
+final class RecordProjection implements ProjectedVerdict { final JsonObject projection; final JsonObject? response; }
+final class Refuse implements BodyVerdict, ProjectedVerdict { final RefusalStatus status; final String reason; }
 ```
 
-Every authentic delivery is `Record`, Slack's `url_verification` included:
-it is written, and its translator returns `NothingToAdmit`. A `Record`'s
-response body goes out only with a `Written` or `AlreadyRecorded`.
+`RelayServer(check: …)` takes the first kind and `RelayServer.projecting(check: …)`
+the second. After the check everything is the same: the rate bound, the
+write, a 2xx only after `Written` or `AlreadyRecorded`, a refusal that
+records nothing.
 
-The check returns a verdict. It doesn't return bytes. On `Record`, the
-relay writes **the buffer it read**, which the check saw only through a view
-it couldn't write to. The relay is the only thing that holds a writer and
-the buffer. No source package can substitute or alter the bytes. That isn't
-a proof the check did its cryptography right. That's what review is for.
+Every authentic delivery is recorded, Slack's `url_verification` included:
+it is written, and its translator returns `NothingToAdmit`. A response body
+goes out only with a `Written` or `AlreadyRecorded`.
+
+**A source that records raw** (`ChecksDeliveries`) returns a verdict, never
+bytes. On `Record`, the relay writes **the buffer it read**, which the check
+saw only through a view it couldn't write to. The relay is the only thing
+that holds a writer and the buffer, so no source package can substitute or
+alter what GitHub or Slack sent. That isn't a proof the check did its
+cryptography right. That's what review is for.
+
+**A source that projects** (`ChecksAndProjectsDeliveries`) chooses what is
+recorded. Its `RecordProjection` carries the fields its translator reads,
+built fresh, and the relay records them encoded as JSON in place of the
+body. This is for a source whose deliveries carry credentials in fields no
+list could name: a Teams activity's open `value` can hold a person's AAD
+token (`signin/tokenExchange`'s `value.token`, Universal Actions SSO's
+`value.authentication.token`). A denylist of such fields leaked three ways
+in teams_module's review. A projection has no field for a credential to land
+in. Its verdict has no `Record`, so a projecting source can't fall back to
+recording the raw body on any path. The cost: for these sources, the
+entry's bytes are what the source's code kept from an authentic delivery,
+not what arrived. Teams' token doesn't bind the body anyway (see below), so
+the bytes never carried that proof. The type stops a projecting source
+falling back to the raw body; it doesn't stop one copying a credential into
+its projection on purpose. Which fields it names is that source's code and
+review.
+
+The entry's shape (`{"at","bytes"}`) is the same for both kinds, so the
+docking station reads them the same way. Only the source's translator reads
+what is in `bytes`, and for a source that starts projecting, it must read
+both the raw entries already in the logbook and the projections after them.
+A projection must:
+
+- **keep what tells two deliveries apart**: the identity the translator
+  builds its `EventKey` from (for Teams, the activity id). Two different
+  deliveries that projected to the same identity would be decided as one,
+  silently, because the relay has already answered 200;
+- **carry a version**, so a translator knows which shape it is reading;
+- **be deterministic**, so the same delivery records the same bytes.
+
+The relay refuses with 500, before anything is written, a projection or
+response JSON can't carry, one nested more than 64 deep, or one holding more
+than 2^20 values. Those limits catch a check's honest mistakes (a `DateTime`
+in a projection, runaway nesting). They don't defend the relay against a
+check written to exhaust it, for example one sharing a huge string across
+many places: a check is trusted code from the source's own package, as it
+already is when it returns `Record`, and a check that misbehaves on purpose
+is a bug in that package, like one that throws an `Error`. Input from a
+sender can't build such a value: `jsonDecode` makes finite trees no larger
+than the body. Making a non-JSON value unbuildable belongs in checked_json.
 
 The relay has no wake filter, so outside the check nothing reads
 uncovered data. For GitHub that matters: `X-GitHub-Event` is a header
@@ -236,7 +291,8 @@ set them.
 ## The HTTP front
 
 `RelayServer`: listens on loopback (default 127.0.0.1, port from config)
-behind the TLS proxy, one path, POST only. It takes a `ChecksDeliveries`, the
+behind the TLS proxy, one path, POST only. It takes a `ChecksDeliveries` (or,
+through `RelayServer.projecting`, a `ChecksAndProjectsDeliveries`), the
 logbook's write socket (a `LogbookSocket`), a clock, the budget, the body cap,
 the cap on requests in flight (each held until its budget ends), the
 per-source write-rate bound, and a log. It logs one line per request: the

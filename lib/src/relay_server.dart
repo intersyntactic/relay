@@ -64,19 +64,133 @@ final class RelayPath {
 /// `RefusalStatus.ofCode(status)?.worthAnotherTry` to decide whether to send
 /// the same bytes again.
 final class RelayServer<V extends Object> {
+  /// A relay that records each authentic delivery exactly as it arrived.
   RelayServer({
+    required ChecksDeliveries<V> check,
+    required LogbookSocket logbook,
+    required RelayPath path,
+    required Duration budget,
+    required WriteRateBound rate,
+    int maxBodyBytes = defaultMaxBodyBytes,
+    int maxInFlight = defaultMaxInFlight,
+    DateTime Function() now = DateTime.now,
+    void Function(String line) log = _stderr,
+  }) : this._(
+         check: check,
+         decide: (vouched, body) =>
+             switch (check.checkBody(vouched, body.asUnmodifiableView())) {
+               Record(:final response) => _recording(body, response),
+               final Refuse refusal => _Refusing(refusal),
+             },
+         logbook: logbook,
+         path: path,
+         budget: budget,
+         rate: rate,
+         maxBodyBytes: maxBodyBytes,
+         maxInFlight: maxInFlight,
+         now: now,
+         log: log,
+       );
+
+  /// A relay that records a projection of each authentic delivery in place
+  /// of what arrived, so a field the projection doesn't name is never
+  /// recorded.
+  RelayServer.projecting({
+    required ChecksAndProjectsDeliveries<V> check,
+    required LogbookSocket logbook,
+    required RelayPath path,
+    required Duration budget,
+    required WriteRateBound rate,
+    int maxBodyBytes = defaultMaxBodyBytes,
+    int maxInFlight = defaultMaxInFlight,
+    DateTime Function() now = DateTime.now,
+    void Function(String line) log = _stderr,
+  }) : this._(
+         check: check,
+         decide: (vouched, body) =>
+             switch (check.checkBody(vouched, body.asUnmodifiableView())) {
+               RecordProjection(:final projection, :final response) =>
+                 _recording(_encode(projection), response),
+               final Refuse refusal => _Refusing(refusal),
+             },
+         logbook: logbook,
+         path: path,
+         budget: budget,
+         rate: rate,
+         maxBodyBytes: maxBodyBytes,
+         maxInFlight: maxInFlight,
+         now: now,
+         log: log,
+       );
+
+  RelayServer._({
     required this.check,
+    required this._decide,
     required this.logbook,
     required this.path,
     required this.budget,
     required this.rate,
-    this.maxBodyBytes = 1024 * 1024,
-    this.maxInFlight = 64,
-    this._now = DateTime.now,
-    this.log = _stderr,
+    required this.maxBodyBytes,
+    required this.maxInFlight,
+    required this._now,
+    required this.log,
   });
 
-  final ChecksDeliveries<V> check;
+  /// The body cap both constructors default to.
+  static const defaultMaxBodyBytes = 1024 * 1024;
+
+  /// The in-flight cap both constructors default to.
+  static const defaultMaxInFlight = 64;
+
+  /// How deep a check's JSON may nest. Deeper is refused, not encoded.
+  static const _maxJsonDepth = 64;
+
+  /// How many values a check's JSON may hold in all, counting a value
+  /// shared between places once per place, as `jsonEncode` would write it.
+  static const _maxJsonValues = 1 << 20;
+
+  /// [o] as the bytes the relay records or sends, or null when it holds a
+  /// value JSON can't carry, nests too deep or holds too many values.
+  /// `JsonObject.of` doesn't check its values, and `jsonEncode` throws an
+  /// `Error` on one, which would end the process; so nothing reaches it
+  /// unchecked.
+  static Uint8List? _encode(JsonObject o) {
+    var left = _maxJsonValues;
+    bool isJson(Object? v, int depth) =>
+        depth <= _maxJsonDepth &&
+        --left >= 0 &&
+        switch (v) {
+          null || bool() || String() || int() => true,
+          final double d => d.isFinite,
+          final List<Object?> l => l.every((e) => isJson(e, depth + 1)),
+          _ => switch (JsonObject.parse(v)) {
+            final JsonObject o => o.keys.every(
+              (k) => isJson(o.raw(k), depth + 1),
+            ),
+            null => false,
+          },
+        };
+    return isJson(o, 0) ? utf8.encode(jsonEncode(o)) : null;
+  }
+
+  /// What to record and send, both encoded before the write, or
+  /// [_Unencodable] when either can't be.
+  static _Decided _recording(Uint8List? bytes, JsonObject? response) {
+    final sent = response == null ? null : _encode(response);
+    if (bytes == null || (response != null && sent == null)) {
+      return const _Unencodable();
+    }
+    return _Recording(bytes, sent);
+  }
+
+  /// The source's check. Its body half is held in [_decide], which is the
+  /// only thing that chooses the bytes recorded.
+  final ChecksDeliveryHeaders<V> check;
+
+  /// The body check, given the relay's own buffer: what to record and the
+  /// response to send, both already encoded, or the refusal. A check sees
+  /// only an unmodifiable view of the buffer.
+  final _Decided Function(V vouched, Uint8List body) _decide;
 
   /// The logbook service's write socket. The relay writes through its own
   /// `LogbookWriter`, whose timeout ends every write inside the budget.
@@ -181,7 +295,9 @@ final class RelayServer<V extends Object> {
     }
 
     final Uint8List bytes;
-    switch (await _read(req, budget - clock.elapsed)) {
+    // The read keeps back the time an answer needs, as the write does, so a
+    // refusal after a slow body still goes out inside the budget.
+    switch (await _read(req, budget - clock.elapsed - _leastToAnswer)) {
       case _TooLarge():
         return _refuseUnread(req, RefusalStatus.payloadTooLarge, 'body', left);
       case _TooSlow():
@@ -203,9 +319,9 @@ final class RelayServer<V extends Object> {
     }
 
     // From here the body is read, so `close()` has nothing left to wait on.
-    final BodyVerdict verdict;
+    final _Decided decided;
     try {
-      verdict = check.checkBody(vouched, bytes.asUnmodifiableView());
+      decided = _decide(vouched, bytes);
     } on Exception catch (e) {
       return _refuse(
         req,
@@ -214,12 +330,19 @@ final class RelayServer<V extends Object> {
         left,
       );
     }
-    final Record record;
-    switch (verdict) {
-      case Refuse(:final status, :final reason):
+    final _Recording recording;
+    switch (decided) {
+      case _Refusing(refusal: Refuse(:final status, :final reason)):
         return _refuse(req, status, reason, left);
-      case final Record r:
-        record = r;
+      case _Unencodable():
+        return _refuse(
+          req,
+          RefusalStatus.internalServerError,
+          'body check returned JSON that cannot be encoded',
+          left,
+        );
+      case final _Recording r:
+        recording = r;
     }
 
     // After the check, so only authentic deliveries spend the bound: an
@@ -228,10 +351,10 @@ final class RelayServer<V extends Object> {
       return _refuse(req, RefusalStatus.tooManyRequests, 'rate bound', left);
     }
 
-    final (outcome, why) = await _write(bytes, clock);
+    final (outcome, why) = await _write(recording.bytes, clock);
     switch (outcome) {
       case _Outcome.recorded:
-        return _send(req, 200, why, left, record.response);
+        return _send(req, 200, why, left, recording.response);
       case _Outcome.absent:
         // Certainly not in the logbook: give the room back, or an outage
         // would leave the bound spent on the retries.
@@ -337,7 +460,7 @@ final class RelayServer<V extends Object> {
     int status,
     String reason,
     Duration Function() left, [
-    JsonObject? response,
+    Uint8List? response,
   ]) async {
     _log(status, reason);
     req.response
@@ -345,7 +468,7 @@ final class RelayServer<V extends Object> {
       ..statusCode = status;
     if (response != null) {
       req.response.headers.contentType = ContentType.json;
-      req.response.write(jsonEncode(response));
+      req.response.add(response);
     }
     await req.response.close();
   }
@@ -413,6 +536,30 @@ final class _TooSlow extends _Body {
 /// The body stream failed: the sender went away mid-body.
 final class _Broken extends _Body {
   const _Broken();
+}
+
+/// What a body check decided, whichever kind of check it was.
+sealed class _Decided {
+  const _Decided();
+}
+
+/// Record [bytes], then answer 2xx with [response]. Both are encoded before
+/// the write, so nothing after it can fail on what a check returned.
+final class _Recording extends _Decided {
+  const _Recording(this.bytes, this.response);
+  final Uint8List bytes;
+  final Uint8List? response;
+}
+
+/// The check returned a projection or response JSON can't carry: its bug,
+/// answered 500 before anything is written.
+final class _Unencodable extends _Decided {
+  const _Unencodable();
+}
+
+final class _Refusing extends _Decided {
+  const _Refusing(this.refusal);
+  final Refuse refusal;
 }
 
 /// What became of a write.
