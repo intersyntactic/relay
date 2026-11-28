@@ -1,3 +1,7 @@
+## 0.5.1
+
+- Requires is_logbook_client ^0.4.0 (was ^0.3.0), so a tree that holds is_relay can lock the client that reads an is_logbook 0.5.0 service. is_relay only writes, and 0.4.0 changed only `subscribe`, `get` and `Entry`; the write and its `WriteResult` cases are the same. No is_logbook_client type is in is_relay's API, so this is a patch.
+
 ## 0.5.0
 
 - `ChecksAndProjectsDeliveries` and `RelayServer.projecting`, for a source whose deliveries mustn't be recorded as they arrived because they can carry credentials in fields no list could name (a Teams activity's open `value`). Its `checkBody` returns a `ProjectedVerdict`: `RecordProjection(projection, response:)` or `Refuse`. It has no `Record`, so a projecting source can't fall back to recording the raw body. The relay encodes the projection as JSON, and the logbook entry keeps its shape.
