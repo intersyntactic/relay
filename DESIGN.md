@@ -56,12 +56,18 @@ latest, and the in-flight cap bounds all unfinished work.
 1. **Refuse at the door**, with a non-2xx, without reading the body: wrong
    path or method, a declared length over the cap, the in-flight cap full,
    no key set yet, or a header check that fails. Answer and drop the
-   connection (`_refuseUnread` in teams_module's `teams_relay.dart`;
-   dart:io's `response.close()` would wait for the whole body). A body
-   refused partway (too large, too slow) is dropped the same way. Its
+   connection (`_refuseUnread` in `relay_server.dart`; dart:io's
+   `response.close()` would wait for the whole body). A body refused
+   partway (too large, too slow, broken) is dropped the same way. Its
    subscription is paused, not cancelled, because cancelling separates
    dart:io's request from its response and the socket can no longer be
-   taken.
+   taken. The paused subscription still holds what was read, but nothing
+   keeps it once the socket is destroyed, so that buffer is freed with it.
+   This was measured on all three paths: 50 refused bodies of nearly the
+   1 MiB cap each left the heap flat after a GC, while a copy of the relay
+   that kept each buffer grew by 50 MiB a batch. So refused bodies hold at
+   most `maxInFlight × maxBodyBytes` (64 MiB at the defaults), and only
+   while they are in flight.
 2. **Read the body** under the cap and the budget into a buffer the relay
    owns. The check gets an unmodifiable view of it (`asUnmodifiableView()`),
    so the bytes written are the bytes checked.
