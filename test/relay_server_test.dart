@@ -41,8 +41,9 @@ final class _TestCheck implements ChecksDeliveries<String> {
 
 /// A source that projects: the same header check as [_TestCheck], and a body
 /// check that keeps only a JSON body's `text`, so its `token` is never
-/// recorded. A body of `refuse` is refused, `throw` makes it throw, and
-/// `unencodable` and `deep` return projections JSON can't carry.
+/// recorded. A body of `refuse` is refused, `throw` makes it throw,
+/// `non-json` builds a projection checked_json refuses, and `deep` one
+/// nested past the relay's depth bound.
 final class _ProjectingCheck implements ChecksAndProjectsDeliveries<String> {
   final seenBodies = <Uint8List>[];
 
@@ -63,16 +64,8 @@ final class _ProjectingCheck implements ChecksAndProjectsDeliveries<String> {
       return const Refuse(RefusalStatus.forbidden, 'refused body');
     }
     if (text == 'throw') throw const FormatException('unreadable');
-    if (text == 'unencodable') {
+    if (text == 'non-json') {
       return RecordProjection(JsonObject.of({'at': DateTime(2026)}));
-    }
-    if (text == 'shared') {
-      // 45 levels of one list held twice: 45 lists, 2^45 places to visit.
-      Object? v = 'leaf';
-      for (var i = 0; i < 45; i++) {
-        v = [v, v];
-      }
-      return RecordProjection(JsonObject.of({'v': v}));
     }
     if (text == 'deep') {
       Object? nested = 'bottom';
@@ -307,9 +300,10 @@ void main() {
       expect((await post('again')).$1, 200);
     });
 
-    test('a response JSON cannot carry is a 500 before anything is written, '
-        'and the relay keeps serving', () async {
+    test('a response checked_json refuses to build is a 500 before anything '
+        'is written, and the relay keeps serving', () async {
       expect((await post('bad response')).$1, 500);
+      expect(logged.last, contains('body check threw JsonFieldException'));
       expect(logbook.requests, isEmpty);
       expect((await post('after')).$1, 200);
     });
@@ -534,22 +528,17 @@ void main() {
       expect(utf8.decode(event!.bytes), isNot(contains('SECRET')));
     });
 
-    test('a projection JSON cannot carry is a 500, nothing written, '
-        'and the relay keeps serving', () async {
-      expect((await post('unencodable')).$1, 500);
+    test('a projection checked_json refuses to build is a 500, nothing '
+        'written, and the relay keeps serving', () async {
+      expect((await post('non-json')).$1, 500);
+      expect(logged.last, contains('body check threw JsonFieldException'));
       expect(logbook.requests, isEmpty);
       expect((await post(withToken)).$1, 200);
     });
 
-    test('a projection too large to walk is a 500, promptly', () async {
-      final clock = Stopwatch()..start();
-      expect((await post('shared')).$1, 500);
-      expect(clock.elapsed, lessThan(const Duration(seconds: 5)));
-      expect(logbook.requests, isEmpty);
-    });
-
     test('a projection nested too deep is a 500, nothing written', () async {
       expect((await post('deep')).$1, 500);
+      expect(logged.last, contains('nested past 64 levels'));
       expect(logbook.requests, isEmpty);
     });
 

@@ -173,16 +173,20 @@ A projection must:
 - **carry a version**, so a translator knows which shape it is reading;
 - **be deterministic**, so the same delivery records the same bytes.
 
-The relay refuses with 500, before anything is written, a projection or
-response JSON can't carry, one nested more than 64 deep, or one holding more
-than 2^20 values. Those limits catch a check's honest mistakes (a `DateTime`
-in a projection, runaway nesting). They don't defend the relay against a
-check written to exhaust it, for example one sharing a huge string across
-many places: a check is trusted code from the source's own package, as it
-already is when it returns `Record`, and a check that misbehaves on purpose
-is a bug in that package, like one that throws an `Error`. Input from a
-sender can't build such a value: `jsonDecode` makes finite trees no larger
-than the body. Making a non-JSON value unbuildable belongs in checked_json.
+A projection or response can't hold a value JSON can't carry: checked_json
+refuses a `DateTime`, `NaN` or non-string key where the `JsonObject` is
+built, with a `JsonFieldException`, so that mistake surfaces inside the
+check and is answered 500 as any check that throws. It also copies the
+object all the way down, so nothing in it is shared and it is exactly as
+large as what the check built. What checked_json doesn't bound is depth,
+and `jsonEncode` recurses, so the relay refuses with 500, before anything
+is written, one nested more than 64 deep. That limit catches a check's
+honest mistake (runaway nesting). It doesn't defend the relay against a
+check written to exhaust it: a check is trusted code from the source's own
+package, as it already is when it returns `Record`, and a check that
+misbehaves on purpose is a bug in that package, like one that throws an
+`Error`. Input from a sender can't build such a value: `jsonDecode` makes
+finite trees no larger than the body.
 
 The relay has no wake filter, so outside the check nothing reads
 uncovered data. For GitHub that matters: `X-GitHub-Event` is a header
