@@ -69,8 +69,10 @@ await RelayServer.projecting(check: TeamsCheck(...), ...).serve(server);
 The relay encodes the projection as JSON and records it where a raw source's
 entry holds the body. A projection must keep the identity its translator
 builds the `EventKey` from (Teams: the activity id), or two deliveries are
-decided as one. Make it versioned and deterministic too. A projection or
-response JSON can't carry is answered 500 and nothing is written.
+decided as one. Make it versioned and deterministic too. checked_json
+refuses a value JSON can't carry where the `JsonObject` is built, so the
+check throws and is answered 500. A projection or response nested more than
+64 deep is answered 500 too. Either way nothing is written.
 
 A check turns any input into a `Refuse` or, at worst, an `Exception`
 (answered 500). It never throws an `Error`: an `Error` is a bug, and

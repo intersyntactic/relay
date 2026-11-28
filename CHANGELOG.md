@@ -1,3 +1,10 @@
+## 0.7.0
+
+- Requires checked_json ^0.4.0 (was ^0.3.0) and is_docking_station_api ^0.10.0 (was ^0.9.0). `RelayedEventSource`, `encodeRelayedEvent` and the relayed entry are unchanged. A minor bump: `ChecksDeliveries.source` exposes `RelayedEventSource`.
+- checked_json 0.4.0 refuses a value JSON can't carry where a `JsonObject` is built, so a check that builds one (a `DateTime` in a projection or response) now throws a `JsonFieldException` inside the check. It is still answered 500 before anything is written, logged as `body check threw JsonFieldException`. Before, the relay found it when encoding.
+- The relay's own encode guard keeps only its 64-level depth bound. The non-JSON checks and the 2^20-value bound are gone: checked_json copies a `JsonObject` all the way down, so nothing in one is shared and it is exactly as large as what the check built.
+- A check that wrote `const JsonObject.of(...)` drops the `const`, as checked_json 0.4.0 requires.
+
 ## 0.6.0
 
 - Requires checked_json ^0.3.0 (was ^0.2.1) and is_docking_station_api ^0.9.0 (was ^0.8.0), so a tree that holds is_relay can move to the checked_json that refuses duplicate keys. is_relay never decodes JSON text, so checked_json's new refusals don't reach it. `RelayedEventSource`, `encodeRelayedEvent` and the relayed entry's `{"at","bytes"}` are unchanged, and the logbook entry is the same. A minor bump for the same reason as 0.3.0: `ChecksDeliveries.source` exposes `RelayedEventSource`.

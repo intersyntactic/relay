@@ -145,40 +145,30 @@ final class RelayServer<V extends Object> {
   /// How deep a check's JSON may nest. Deeper is refused, not encoded.
   static const _maxJsonDepth = 64;
 
-  /// How many values a check's JSON may hold in all, counting a value
-  /// shared between places once per place, as `jsonEncode` would write it.
-  static const _maxJsonValues = 1 << 20;
-
-  /// [o] as the bytes the relay records or sends, or null when it holds a
-  /// value JSON can't carry, nests too deep or holds too many values.
-  /// `JsonObject.of` doesn't check its values, and `jsonEncode` throws an
-  /// `Error` on one, which would end the process; so nothing reaches it
-  /// unchecked.
+  /// [o] as the bytes the relay records or sends, or null when it nests
+  /// past [_maxJsonDepth]. A `JsonObject` holds only values `jsonEncode`
+  /// can write, but nothing bounds its depth, and `jsonEncode` recurses.
   static Uint8List? _encode(JsonObject o) {
-    var left = _maxJsonValues;
-    bool isJson(Object? v, int depth) =>
+    bool within(Object? v, int depth) =>
         depth <= _maxJsonDepth &&
-        --left >= 0 &&
         switch (v) {
-          null || bool() || String() || int() => true,
-          final double d => d.isFinite,
-          final List<Object?> l => l.every((e) => isJson(e, depth + 1)),
+          final List<Object?> l => l.every((e) => within(e, depth + 1)),
           _ => switch (JsonObject.parse(v)) {
             final JsonObject o => o.keys.every(
-              (k) => isJson(o.raw(k), depth + 1),
+              (k) => within(o.raw(k), depth + 1),
             ),
-            null => false,
+            null => true,
           },
         };
-    return isJson(o, 0) ? utf8.encode(jsonEncode(o)) : null;
+    return within(o, 0) ? utf8.encode(jsonEncode(o)) : null;
   }
 
   /// What to record and send, both encoded before the write, or
-  /// [_Unencodable] when either can't be.
+  /// [_TooDeep] when either nests too deep.
   static _Decided _recording(Uint8List? bytes, JsonObject? response) {
     final sent = response == null ? null : _encode(response);
     if (bytes == null || (response != null && sent == null)) {
-      return const _Unencodable();
+      return const _TooDeep();
     }
     return _Recording(bytes, sent);
   }
@@ -334,11 +324,11 @@ final class RelayServer<V extends Object> {
     switch (decided) {
       case _Refusing(refusal: Refuse(:final status, :final reason)):
         return _refuse(req, status, reason, left);
-      case _Unencodable():
+      case _TooDeep():
         return _refuse(
           req,
           RefusalStatus.internalServerError,
-          'body check returned JSON that cannot be encoded',
+          'body check returned JSON nested past $_maxJsonDepth levels',
           left,
         );
       case final _Recording r:
@@ -551,10 +541,11 @@ final class _Recording extends _Decided {
   final Uint8List? response;
 }
 
-/// The check returned a projection or response JSON can't carry: its bug,
-/// answered 500 before anything is written.
-final class _Unencodable extends _Decided {
-  const _Unencodable();
+/// The check returned a projection or response nested past
+/// [RelayServer._maxJsonDepth]: its bug, answered 500 before anything is
+/// written.
+final class _TooDeep extends _Decided {
+  const _TooDeep();
 }
 
 final class _Refusing extends _Decided {
