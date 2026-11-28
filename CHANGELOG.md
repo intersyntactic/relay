@@ -1,3 +1,7 @@
+## 0.6.0
+
+- Requires checked_json ^0.3.0 (was ^0.2.1) and is_docking_station_api ^0.9.0 (was ^0.8.0), so a tree that holds is_relay can move to the checked_json that refuses duplicate keys. is_relay never decodes JSON text, so checked_json's new refusals don't reach it. `RelayedEventSource`, `encodeRelayedEvent` and the relayed entry's `{"at","bytes"}` are unchanged, and the logbook entry is the same. A minor bump for the same reason as 0.3.0: `ChecksDeliveries.source` exposes `RelayedEventSource`.
+
 ## 0.5.1
 
 - Requires is_logbook_client ^0.4.0 (was ^0.3.0), so a tree that holds is_relay can lock the client that reads an is_logbook 0.5.0 service. is_relay only writes, and 0.4.0 changed only `subscribe`, `get` and `Entry`; the write and its `WriteResult` cases are the same. No is_logbook_client type is in is_relay's API, so this is a patch.
