@@ -1,3 +1,7 @@
+## 0.8.0
+
+- Requires is_docking_station_api ^0.11.0 (was ^0.10.0), so a module on 0.11, whose `MessageSaid` carries `forTheAgent`, can hold is_relay. `RelayedEventSource`, `encodeRelayedEvent` and the relayed entry are unchanged; 0.11.0 changed only decision and translated-event entries. A minor bump: `ChecksDeliveries.source` exposes `RelayedEventSource`.
+
 ## 0.7.0
 
 - Requires checked_json ^0.4.0 (was ^0.3.0) and is_docking_station_api ^0.10.0 (was ^0.9.0). `RelayedEventSource`, `encodeRelayedEvent` and the relayed entry are unchanged. A minor bump: `ChecksDeliveries.source` exposes `RelayedEventSource`.
